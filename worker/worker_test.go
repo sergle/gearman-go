@@ -12,6 +12,7 @@ import (
 var (
 	worker              *Worker
 	runIntegrationTests bool
+	runKnownBugTests    bool
 )
 
 func init() {
@@ -20,6 +21,7 @@ func init() {
 
 func TestMain(m *testing.M) {
 	integrationsTestFlag := flag.Bool("integration", false, "Run the integration tests (in addition to the unit tests)")
+	knownBugsFlag := flag.Bool("knownbugs", false, "Run the tests for known unfixed defects (expected to FAIL)")
 	// Without this the flag is read before anything parses it, so
 	// runIntegrationTests is always false and every worker integration test
 	// skips even when -integration is given. client/client_test.go parses; this
@@ -27,6 +29,9 @@ func TestMain(m *testing.M) {
 	flag.Parse()
 	if integrationsTestFlag != nil {
 		runIntegrationTests = *integrationsTestFlag
+	}
+	if knownBugsFlag != nil {
+		runKnownBugTests = *knownBugsFlag
 	}
 	code := m.Run()
 	os.Exit(code)

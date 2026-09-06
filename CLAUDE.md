@@ -31,14 +31,26 @@ make check                           # build + vet + fmt-check + test + examples
 make test                            # default suite, no gearmand
 make knownbugs                       # known unfixed defects — expected to FAIL
 make reproducers                     # the three race reproducers — expected to FAIL
+make bench                           # benchmarks vs the fake servers, no gearmand
 go test -run TestClientDo ./client    # single test
 ```
 
-`make check` is the gate that must pass today. `make race`, `make knownbugs`
-and `make reproducers` are expected to fail while defects in `docs/todo.md`
-remain open — that is the point of them, so do not "fix" them by weakening the
-test. Which cases fail changes as fixes land, so read the per-test output
-rather than the exit code, and record what it shows in `docs/todo.md`.
+`make check` is the gate that must pass. `make race`, `make knownbugs` and
+`make reproducers` exist to fail: each one runs tests that describe behaviour
+the code does not have yet, so a red run is the expected state and making one
+green by weakening its test defeats the point. Which cases fail changes as
+fixes land, so read the per-test output rather than the exit code. The
+per-defect notes live in `docs/`.
+
+`make bench` is the same bargain in benchmark form: a case whose defect makes
+it wedge fails its watchdog instead of reporting a number. Benchmarks run
+against the in-process fake servers, need no gearmand, and are not part of
+`make check` — `go test` skips them unless `-bench` is given, so the default
+suite pays only the compile. `BENCH`, `BENCHTIME`, `BENCHCOUNT` and
+`BENCH_TIMEOUT` override what runs; `BENCHTIME` is a fixed iteration count
+rather than a duration so two runs stay comparable when the code gets faster.
+Compare medians across `-count` runs: single runs of anything concurrent here
+vary by more than the effects being measured.
 
 `go vet ./...` reports two pre-existing `unreachable code` findings
 (in `client/client.go` and `client/pool_test.go`) and therefore exits
@@ -64,18 +76,27 @@ Consequences:
 - If the library itself ever gains a real dependency, it goes in the root
   go.mod; nothing else should.
 
-**33 of the 76 test functions are skipped by default; 43 run.** (Counted at
-`a4b2b37`; the upstream merge added `client/exceptions_test.go`, which runs by
-default.) Everything still gated behind `-integration` is the *original*
-upstream suite — every one of its tests of `Do`, `DoBg`, `Status`, `Echo`,
-`Close` and `Pool` needs a live gearmand. Assume `-race` alone proves nothing
-about whether job submission still works.
+**A large minority of the test functions are skipped by default** — count them
+with `go test ./... -v | grep -c SKIP` rather than trusting a number written
+here. Everything gated behind `-integration` is the *original* upstream suite:
+every one of its tests of `Do`, `DoBg`, `Status`, `Echo`, `Close` and `Pool`
+needs a live gearmand. Assume `-race` alone proves nothing about whether job
+submission still works.
 
 A gearmand is not required to test this code: the wire format is 4-byte magic,
 4-byte type, 4-byte big-endian length, body, and an in-process fake server
 answering `OPTION_RES`, `JOB_CREATED`, `ECHO_RES`, `STATUS_RES` and
 `WORK_COMPLETE` is enough to drive the real client through `Do`, `DoBg` and
 `Echo`.
+
+The worker side has its own, `worker/fakeserver_test.go`: it answers
+`GRAB_JOB{,_UNIQ}` with `JOB_ASSIGN_UNIQ`, stays silent on `PRE_SLEEP` until
+`Serve()` wakes the worker with a `NOOP`, and counts the `WORK_COMPLETE`s that
+come back. The two cannot be merged — the wire constants are duplicated per
+package and each side speaks the opposite half of the protocol. Its
+`JOB_ASSIGN_UNIQ` body must carry exactly four NUL-separated fields
+(`handle\0fn\0uniq\0data`): with three, `decodeInPack` drops the contents,
+`fn` comes out empty and the worker silently dispatches nothing.
 
 `OPTION_RES` is not optional. `DefaultExceptions` is true, so `connect()` sends
 an `OPTION_REQ` as the **first packet on every connection**, redials included.
@@ -92,7 +113,7 @@ knownbugs` get this right for you):
 
 ```sh
 go test ./client ./worker -integration  # needs gearmand on 127.0.0.1:4730
-go test ./client -knownbugs             # known unfixed defects; expected to FAIL
+go test ./client ./worker -knownbugs    # known unfixed defects; expected to FAIL
 ```
 
 `go test -integration ./client` (flag first) is a silent no-op — go treats the
@@ -100,9 +121,9 @@ unrecognised flag and everything after it as arguments for the test binary of
 the *current directory*, so it tests the root package, reports "no test files"
 and exits 0. It looks like a pass and verifies nothing.
 
-The gates are package-level bools set in `TestMain`: `runIntegrationTests`
-(`client/client_test.go`, `worker/worker_test.go`) and `runKnownBugTests`
-(`client/client_test.go`). New tests must check the relevant one explicitly, or
+The gates are package-level bools set in `TestMain`: `runIntegrationTests` and
+`runKnownBugTests`, both defined in `client/client_test.go` and
+`worker/worker_test.go`. New tests must check the relevant one explicitly, or
 they will run in CI with no job server.
 
 A `TestMain` that defines such a flag must call `flag.Parse()` *before*
@@ -110,9 +131,10 @@ dereferencing it. Without that the gate reads the zero value, every gated test
 in the package skips even when the flag is given, and the run looks green while
 verifying nothing.
 
-`client/knownbugs_test.go` holds tests describing behaviour the client *should*
-have; they fail today by design. Nothing there may call a blocking client
-method on the test goroutine — each goes through `mustReturnWithin`, so a
+`client/knownbugs_test.go` and `worker/knownbugs_test.go` hold tests describing
+behaviour the packages *should* have; they fail by design. Nothing there may
+call a blocking method on the test goroutine — each goes through
+`mustReturnWithin` or an equivalent deadline, so a
 hanging defect fails one test instead of wedging the binary until its global
 timeout kills every other result too.
 

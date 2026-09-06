@@ -37,6 +37,11 @@ import (
 // package is tested under -race specifically to find races in the client, so a
 // race in the harness would be indistinguishable from the bug under test.
 
+// benchHandle is the handle the server hands back with recording off. Fixed, so
+// no per-iteration map entry is needed to coalesce ids. Defined here rather
+// than in bench_test.go because handleFor below is what uses it.
+const benchHandle = "H:bench:1"
+
 // fakeRequest is one packet received from the client.
 type fakeRequest struct {
 	DataType uint32
@@ -65,13 +70,15 @@ type fakeJobServer struct {
 	optionReqs int // OPTION_REQ packets seen; kept out of requests, see serve
 	conns      []net.Conn
 	silent     bool
+	record     bool // record requests and coalesce ids; see SetRecord
 	handles    int
 	byId       map[string]string // unique id -> handle, for coalescing
 	status     map[string]fakeStatus
 }
 
-// newFakeJobServer starts a server on a free port and stops it when the test ends.
-func newFakeJobServer(t *testing.T) *fakeJobServer {
+// newFakeJobServer starts a server on a free port and stops it when the test
+// ends. testing.TB rather than *testing.T so benchmarks can use it.
+func newFakeJobServer(t testing.TB) *fakeJobServer {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -79,6 +86,7 @@ func newFakeJobServer(t *testing.T) *fakeJobServer {
 	}
 	s := &fakeJobServer{
 		ln:     ln,
+		record: true,
 		byId:   map[string]string{},
 		status: map[string]fakeStatus{},
 	}
@@ -136,7 +144,7 @@ func (s *fakeJobServer) serve(conn net.Conn) {
 		s.mu.Lock()
 		if req.DataType == dtOptionReq {
 			s.optionReqs++
-		} else {
+		} else if s.record {
 			s.requests = append(s.requests, req)
 		}
 		silent := s.silent
@@ -186,9 +194,16 @@ func (s *fakeJobServer) respond(conn net.Conn, req fakeRequest) {
 
 // handleFor allocates a handle for a unique id, coalescing repeat submissions
 // of the same id onto the same handle as gearmand does.
+//
+// With recording off it returns one fixed handle and keeps no map: coalescing
+// costs an entry per unique id, and a benchmark submits a fresh id every
+// iteration, so the map would grow with b.N inside the measured region.
 func (s *fakeJobServer) handleFor(id string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.record {
+		return benchHandle
+	}
 	if h, ok := s.byId[id]; ok {
 		return h
 	}
@@ -257,6 +272,20 @@ func (s *fakeJobServer) SetSilent(silent bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.silent = silent
+}
+
+// SetRecord turns request recording on or off. It is on by default, which is
+// what every test asserting on Requests() needs.
+//
+// Benchmarks turn it off: recording appends a fakeRequest plus a copy of the
+// body per iteration, and handleFor adds a map entry per unique id, so with it
+// on the harness allocates more than the client does and the numbers measure
+// the wrong program. OPTION_REQ is still counted either way -- that is one
+// packet per connection, not per request.
+func (s *fakeJobServer) SetRecord(record bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record = record
 }
 
 // SetStatus fixes what GET_STATUS reports for a handle.

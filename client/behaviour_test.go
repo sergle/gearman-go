@@ -17,7 +17,8 @@ import (
 // Some overlap with the TestFakeServer* self-tests is deliberate: those exist
 // to prove the harness speaks the protocol, these to pin the client's contract.
 
-func newTestClient(t *testing.T, s *fakeJobServer) *Client {
+// testing.TB rather than *testing.T so bench_test.go can use it too.
+func newTestClient(t testing.TB, s *fakeJobServer) *Client {
 	t.Helper()
 	c, err := New(Network, s.Addr())
 	if err != nil {

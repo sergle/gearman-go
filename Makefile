@@ -14,6 +14,15 @@ GO      ?= go
 PKGS    ?= ./...
 TIMEOUT ?= 120s
 
+# Benchmark knobs. BENCHTIME is a fixed iteration count rather than a duration
+# so a run is comparable across machines and across a code change; BENCHCOUNT
+# is above 1 on purpose, because a single run is not evidence for anything
+# concurrent (see docs/race_plan.md).
+BENCH         ?= .
+BENCHTIME     ?= 2000x
+BENCHCOUNT    ?= 10
+BENCH_TIMEOUT ?= 600s
+
 GEARMAND_HOST  ?= 127.0.0.1
 GEARMAND_PORT  ?= 4730
 # Pinned, not :latest, so a run is reproducible. 2.1.0, 2.1.0-alpine and latest
@@ -34,23 +43,35 @@ port_open = bash -c 'exec 3<>/dev/tcp/$(GEARMAND_HOST)/$(GEARMAND_PORT)' 2>/dev/
 VET_BASELINE := ^#|client/client\.go:[0-9]+:[0-9]+: unreachable code|client/pool_test\.go:[0-9]+:[0-9]+: unreachable code
 
 .DEFAULT_GOAL := help
-.PHONY: help build test race vet fmt fmt-check examples knownbugs reproducers \
-        integration gearmand gearmand-stop tidy clean check ci
+.PHONY: help build test bench race vet fmt fmt-check examples knownbugs \
+        reproducers integration gearmand gearmand-stop tidy clean check ci
 
 help: ## Show this help
 	@echo "gearman-go targets:"
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[1m%-14s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "Expected to FAIL until the remaining client defects are fixed: race, knownbugs, reproducers."
-	@echo "Since the a4b2b37 merge: reproducers fails on TestRaceErrorHandler only,"
-	@echo "knownbugs on 4 tests. Read the per-test output, not just the exit code."
+	@echo "race, knownbugs and reproducers exist to FAIL while the defects they"
+	@echo "describe are open; bench fails the cases whose defect wedges them."
+	@echo "Read the per-test output, not the exit code -- which cases fail is the"
+	@echo "signal, and it changes as fixes land. See docs/ for the defect notes."
 
 build: ## Compile the library
 	$(GO) build $(PKGS)
 
 test: ## Run the default test suite (no gearmand needed)
 	$(GO) test -count=1 -timeout $(TIMEOUT) $(PKGS)
+
+# -run xxx matches no test, so only the benchmarks run. Deliberately not part of
+# check: `go test` skips benchmarks unless -bench is given, so the new files
+# cost the default suite nothing but a compile.
+#
+# BenchmarkClientMixedDoAndEcho is expected to FAIL until todo.md sections 4
+# and 5 are fixed: interleaved writes lose the framing and Echo has no timeout,
+# so it wedges and its watchdog fires. Everything else reports a number.
+bench: ## Run the benchmarks against the in-process fake servers (no gearmand)
+	$(GO) test -run xxx -bench '$(BENCH)' -benchtime $(BENCHTIME) \
+	  -count $(BENCHCOUNT) -benchmem -timeout $(BENCH_TIMEOUT) ./client ./worker
 
 vet: ## Run go vet, ignoring the pre-existing baseline findings
 	@out=$$($(GO) vet $(PKGS) 2>&1 | grep -Ev '$(VET_BASELINE)' || true); \
@@ -87,9 +108,11 @@ reproducers: ## The three documented race reproducers (expected FAIL)
 	$(GO) test -race -count=1 -timeout $(TIMEOUT) ./client -run TestRace
 
 # No -run filter on purpose: the -knownbugs gate already selects them, so new
-# entries in knownbugs_test.go are picked up without editing this Makefile.
+# entries in either knownbugs_test.go are picked up without editing this
+# Makefile. Both packages define the flag; passing it to a package that did not
+# would fail with "flag provided but not defined".
 knownbugs: ## Tests for known unfixed defects (expected FAIL)
-	$(GO) test -count=1 -timeout $(TIMEOUT) ./client -knownbugs
+	$(GO) test -count=1 -timeout $(TIMEOUT) ./client ./worker -knownbugs
 
 # --- occasional ------------------------------------------------------------
 
