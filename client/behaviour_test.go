@@ -17,7 +17,7 @@ import (
 // Some overlap with the TestFakeServer* self-tests is deliberate: those exist
 // to prove the harness speaks the protocol, these to pin the client's contract.
 
-func newTestClient(t *testing.T, s *fakeServer) *Client {
+func newTestClient(t *testing.T, s *fakeJobServer) *Client {
 	t.Helper()
 	c, err := New(Network, s.Addr())
 	if err != nil {
@@ -30,7 +30,7 @@ func newTestClient(t *testing.T, s *fakeServer) *Client {
 // Do returns the handle the server assigned and routes the completion to the
 // caller's handler.
 func TestDoReturnsHandleAndDeliversCompletion(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	c := newTestClient(t, s)
 
 	type completion struct {
@@ -64,7 +64,7 @@ func TestDoReturnsHandleAndDeliversCompletion(t *testing.T) {
 
 // DoBg returns a handle without waiting for a result.
 func TestDoBgReturnsHandle(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	c := newTestClient(t, s)
 
 	handle, err := c.DoBg("ToUpper", []byte("hello"), JobNormal)
@@ -95,7 +95,7 @@ func TestSubmitWireFormat(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newFakeServer(t)
+			s := newFakeJobServer(t)
 			c := newTestClient(t, s)
 
 			var err error
@@ -123,7 +123,7 @@ func TestSubmitWireFormat(t *testing.T) {
 // Echo round-trips bytes verbatim, including an embedded NUL — the byte the
 // protocol itself uses as a field separator.
 func TestEchoRoundTripsNulBytes(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	c := newTestClient(t, s)
 
 	payload := []byte("Hello\x00 world")
@@ -138,7 +138,7 @@ func TestEchoRoundTripsNulBytes(t *testing.T) {
 
 // Status parses every field of STATUS_RES.
 func TestStatusParsesResponse(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	s.SetStatus("H:fake:9", fakeStatus{
 		Known: true, Running: false, Numerator: 3, Denominator: 9,
 	})
@@ -164,7 +164,7 @@ func TestStatusParsesResponse(t *testing.T) {
 
 // An empty unique id is rejected before anything is written to the server.
 func TestDoWithIdRejectsEmptyId(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	c := newTestClient(t, s)
 
 	if _, err := c.DoWithId("ToUpper", []byte("x"), JobNormal, nil, ""); err != ErrInvalidId {
@@ -180,7 +180,7 @@ func TestDoWithIdRejectsEmptyId(t *testing.T) {
 
 // Resubmitting the same unique id coalesces onto the same handle.
 func TestSameIdYieldsSameHandle(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	c := newTestClient(t, s)
 
 	first, err := c.DoBgWithId("ToUpper", []byte("x"), JobNormal, "same-id")
@@ -207,7 +207,7 @@ func TestSameIdYieldsSameHandle(t *testing.T) {
 // Close can be called repeatedly, and afterwards every request-sending method
 // reports the connection is gone rather than panicking or hanging.
 func TestCloseIsIdempotentAndSubsequentCallsFail(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	c := newTestClient(t, s)
 
 	if err := c.Close(); err != nil {

@@ -64,7 +64,7 @@ func mustReturnWithin(t *testing.T, d time.Duration, what string, fn func() erro
 func TestConcurrentSubmitAndEchoDoNotCorruptTheStream(t *testing.T) {
 	requireKnownBugs(t)
 
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	c := newTestClient(t, s)
 	c.ResponseTimeout = 200 * time.Millisecond
 
@@ -122,7 +122,7 @@ func TestConcurrentSubmitAndEchoDoNotCorruptTheStream(t *testing.T) {
 func TestEchoTimesOutWhenServerNeverAnswers(t *testing.T) {
 	requireKnownBugs(t)
 
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	s.SetSilent(true)
 	c := newTestClient(t, s)
 	c.ResponseTimeout = 100 * time.Millisecond
@@ -142,7 +142,7 @@ func TestEchoTimesOutWhenServerNeverAnswers(t *testing.T) {
 func TestStatusTimesOutWhenServerNeverAnswers(t *testing.T) {
 	requireKnownBugs(t)
 
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	s.SetSilent(true)
 	c := newTestClient(t, s)
 	c.ResponseTimeout = 100 * time.Millisecond
@@ -156,55 +156,12 @@ func TestStatusTimesOutWhenServerNeverAnswers(t *testing.T) {
 	}
 }
 
-// todo.md section 6: Pool.Do takes the embedded Client.Mutex (pool.go:96) and
-// then calls Client.Do, which reaches do() and takes the same non-reentrant
-// mutex again. Every Pool.Do call deadlocks on the first attempt.
+// The Pool.Do / Pool.DoBg deadlock tests that used to live here were deleted
+// when the upstream merge (7341bb3) fixed the defect: upstream's own
+// pool_deadlock_test.go covers both calls, asserts the returned handle, and
+// runs in the default suite rather than behind -knownbugs — which is where a
+// fixed defect's regression test belongs.
 //
-// Fixed by: Phase 6 (drop the outer Lock; Client serialises itself).
-func TestPoolDoDoesNotDeadlock(t *testing.T) {
-	requireKnownBugs(t)
-
-	s := newFakeServer(t)
-	p := NewPool()
-	if err := p.Add(Network, s.Addr(), 1); err != nil {
-		t.Fatal(err)
-	}
-	// No t.Cleanup(p.Close) on purpose: Pool.Close calls Client.Close, which
-	// takes the same mutex the deadlocked Pool.Do goroutine is still holding,
-	// so cleaning up would hang the test binary instead of the one test. The
-	// fake server's own cleanup closes the sockets.
-
-	err := mustReturnWithin(t, 2*time.Second, "Pool.Do", func() error {
-		_, _, err := p.Do("f", []byte("payload"), JobNormal, nil)
-		return err
-	})
-	if err != nil {
-		t.Errorf("Pool.Do err = %v, want nil", err)
-	}
-}
-
-// todo.md section 6, the same deadlock in Pool.DoBg (pool.go:105).
-//
-// Fixed by: Phase 6.
-func TestPoolDoBgDoesNotDeadlock(t *testing.T) {
-	requireKnownBugs(t)
-
-	s := newFakeServer(t)
-	p := NewPool()
-	if err := p.Add(Network, s.Addr(), 1); err != nil {
-		t.Fatal(err)
-	}
-	// See TestPoolDoDoesNotDeadlock: no p.Close() cleanup, for the same reason.
-
-	err := mustReturnWithin(t, 2*time.Second, "Pool.DoBg", func() error {
-		_, _, err := p.DoBg("f", []byte("payload"), JobNormal)
-		return err
-	})
-	if err != nil {
-		t.Errorf("Pool.DoBg err = %v, want nil", err)
-	}
-}
-
 // todo.md section 6: Pool.selectServer (pool.go:157-166) spins forever when the
 // pool is empty. SelectWithRate returns pool.last ("") with nothing to choose
 // from, the map lookup misses, and `for client == nil` goes round again. Pool

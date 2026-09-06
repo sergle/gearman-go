@@ -4,18 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-This is a fork of `github.com/mikespook/gearman-go`. Several defects in the
-`client` package are known and unfixed — do not "discover" them again or work
-around them silently:
-
-- `client.Client` shares `conn`, `rw` and `ErrorHandler` across goroutines with
-  almost no synchronisation. `client/race_test.go` reproduces this; the three
-  `TestRace*` cases fail every run under `-race`, though the number of reports
-  varies, so trust pass/fail rather than a count.
-- `Pool.Do`/`DoBg`/`Status`/`Echo` deadlock on the first call — they take the
-  embedded `Client.Mutex`, then call through to `do`, which takes it again.
-- `Client.Status` and `Client.Echo` write without the mutex and block forever
-  if no response arrives.
+This is a fork of `github.com/mikespook/gearman-go`
 
 ## Building and testing
 
@@ -46,8 +35,10 @@ go test -run TestClientDo ./client    # single test
 ```
 
 `make check` is the gate that must pass today. `make race`, `make knownbugs`
-and `make reproducers` are expected to fail until the client races are fixed —
-that is the point of them, so do not "fix" them by weakening the test.
+and `make reproducers` are expected to fail while defects in `docs/todo.md`
+remain open — that is the point of them, so do not "fix" them by weakening the
+test. Which cases fail changes as fixes land, so read the per-test output
+rather than the exit code, and record what it shows in `docs/todo.md`.
 
 `go vet ./...` reports two pre-existing `unreachable code` findings
 (in `client/client.go` and `client/pool_test.go`) and therefore exits
@@ -73,16 +64,27 @@ Consequences:
 - If the library itself ever gains a real dependency, it goes in the root
   go.mod; nothing else should.
 
-**29 of the 36 test functions are skipped by default.** Only 7 run without a
-gearmand, and one of those (`TestWorkerRace`) passes vacuously. The `client`
-package has no behavioural coverage in a default run — every test of `Do`,
-`DoBg`, `Status`, `Echo`, `Close` and `Pool` is gated. Assume `-race` alone
-proves nothing about whether job submission still works.
+**33 of the 76 test functions are skipped by default; 43 run.** (Counted at
+`a4b2b37`; the upstream merge added `client/exceptions_test.go`, which runs by
+default.) Everything still gated behind `-integration` is the *original*
+upstream suite — every one of its tests of `Do`, `DoBg`, `Status`, `Echo`,
+`Close` and `Pool` needs a live gearmand. Assume `-race` alone proves nothing
+about whether job submission still works.
 
 A gearmand is not required to test this code: the wire format is 4-byte magic,
 4-byte type, 4-byte big-endian length, body, and an in-process fake server
-answering `JOB_CREATED`, `ECHO_RES`, `STATUS_RES` and `WORK_COMPLETE` is enough
-to drive the real client through `Do`, `DoBg` and `Echo`.
+answering `OPTION_RES`, `JOB_CREATED`, `ECHO_RES`, `STATUS_RES` and
+`WORK_COMPLETE` is enough to drive the real client through `Do`, `DoBg` and
+`Echo`.
+
+`OPTION_RES` is not optional. `DefaultExceptions` is true, so `connect()` sends
+an `OPTION_REQ` as the **first packet on every connection**, redials included.
+A fake server that ignores it leaves `processLoop` treating the first real
+response as the option's answer, marking the connection `exceptionsRefused` —
+the tests still pass, but they are exercising the degraded handshake instead of
+the default one. `client/fakeserver_test.go` answers it and counts it in
+`OptionReqs()` rather than in `Requests()`, so the handshake does not shift the
+index of the job packets tests assert on.
 
 Two custom test-binary flags gate tests that are not part of the default run.
 **Both must come after the package list** (`make integration` / `make
@@ -102,6 +104,11 @@ The gates are package-level bools set in `TestMain`: `runIntegrationTests`
 (`client/client_test.go`, `worker/worker_test.go`) and `runKnownBugTests`
 (`client/client_test.go`). New tests must check the relevant one explicitly, or
 they will run in CI with no job server.
+
+A `TestMain` that defines such a flag must call `flag.Parse()` *before*
+dereferencing it. Without that the gate reads the zero value, every gated test
+in the package skips even when the flag is given, and the run looks green while
+verifying nothing.
 
 `client/knownbugs_test.go` holds tests describing behaviour the client *should*
 have; they fail today by design. Nothing there may call a blocking client
@@ -130,7 +137,13 @@ The Gearman wire constants (`dtCanDo`, `dtWorkComplete`, packet framing,
 
 ### Client
 
-`New` dials, then starts two goroutines that run for the client's lifetime:
+`New` calls `connect()` — dial, then (when `DefaultExceptions` is true) write
+`OPTION_REQ` onto the fresh `rw` *before* `setConn` publishes it, which is what
+guarantees it is the first packet on the wire; do not move that write after
+`setConn`. `connect()` is also what `readLoop` re-dials with, so the option is
+re-requested on every reconnect — gearmand keeps it per connection.
+
+`New` then starts two goroutines that run for the client's lifetime:
 
 - `readLoop` — reads bytes off `rw`, re-frames them into packets (it buffers a
   partial tail in `leftdata` and re-parses, because a TCP read does not align
@@ -141,7 +154,7 @@ Responses are correlated by a **fixed key**, not by request identity:
 `innerHandler` is keyed `"c"` for the next job-created, `"e"` for echo, and
 `"s"+handle` for status. `processLoop` moves the caller's handler into its own
 `rhandlers` map keyed by the real job handle once the server assigns one
-(`handleInner`, `client.go:205`).
+(`handleInner`, `client.go:368`).
 
 That single `"c"` slot is why `do` holds `client.Mutex` across the **entire**
 round trip — write, then block on the result channel until `processLoop`
@@ -151,13 +164,13 @@ whole file:
 > `readLoop` and `processLoop` must never take `client.Mutex`. If they do, they
 > cannot deliver the response that `do` is holding the lock waiting for.
 
-`client.go:139` already breaks it (`readLoop` calls `Close()`, which locks).
-Anything that needs to synchronise connection state therefore needs its own
-lock, held only around load/store and never across I/O — reusing
-`client.Mutex` deadlocks.
+`client.go:267` breaks it: `readLoop` calls `Close()`, which locks. Connection
+state therefore has its own lock, `connMu` (`client.go:55`), reached through
+`getConn` / `getRW` / `setConn` and held only around load/store, never across
+I/O. Do not reuse `client.Mutex` for it — that deadlocks.
 
-`readLoop` also re-dials internally on error (`client.go:136-147`), which can
-resurrect a connection the caller deliberately closed.
+`readLoop` also re-dials internally on error (`client.go:262-277`), so a
+connection the caller closed can come back.
 
 `Pool` wraps N clients with a `SelectionHandler` for server selection. It is
 not a connection pool to one server.

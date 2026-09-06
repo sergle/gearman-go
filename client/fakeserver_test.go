@@ -17,10 +17,17 @@ import (
 //
 // It answers:
 //
+//	OPTION_REQ                    -> OPTION_RES (body verbatim)
 //	SUBMIT_JOB{,_HIGH,_LOW}       -> JOB_CREATED, then WORK_COMPLETE
 //	SUBMIT_JOB{,_HIGH,_LOW}_BG    -> JOB_CREATED only
 //	ECHO_REQ                      -> ECHO_RES (body verbatim)
 //	GET_STATUS                    -> STATUS_RES
+//
+// OPTION_REQ is answered because connect() sends one as the first packet on
+// every connection whenever DefaultExceptions is true, which is the default. A
+// server that ignored it would leave every test exercising the degraded
+// handshake (processLoop treats the first reply as the option's answer) instead
+// of the normal path.
 //
 // Handles are deterministic: H:fake:1, H:fake:2, ... in submit order. Repeat
 // submissions of the same unique id coalesce onto the same handle, as gearmand
@@ -50,26 +57,27 @@ type fakeStatus struct {
 	Numerator, Denominator uint64
 }
 
-type fakeServer struct {
+type fakeJobServer struct {
 	ln net.Listener
 
-	mu       sync.Mutex
-	requests []fakeRequest
-	conns    []net.Conn
-	silent   bool
-	handles  int
-	byId     map[string]string // unique id -> handle, for coalescing
-	status   map[string]fakeStatus
+	mu         sync.Mutex
+	requests   []fakeRequest
+	optionReqs int // OPTION_REQ packets seen; kept out of requests, see serve
+	conns      []net.Conn
+	silent     bool
+	handles    int
+	byId       map[string]string // unique id -> handle, for coalescing
+	status     map[string]fakeStatus
 }
 
-// newFakeServer starts a server on a free port and stops it when the test ends.
-func newFakeServer(t *testing.T) *fakeServer {
+// newFakeJobServer starts a server on a free port and stops it when the test ends.
+func newFakeJobServer(t *testing.T) *fakeJobServer {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &fakeServer{
+	s := &fakeJobServer{
 		ln:     ln,
 		byId:   map[string]string{},
 		status: map[string]fakeStatus{},
@@ -80,9 +88,9 @@ func newFakeServer(t *testing.T) *fakeServer {
 }
 
 // Addr is the host:port to hand to New.
-func (s *fakeServer) Addr() string { return s.ln.Addr().String() }
+func (s *fakeJobServer) Addr() string { return s.ln.Addr().String() }
 
-func (s *fakeServer) stop() {
+func (s *fakeJobServer) stop() {
 	s.ln.Close()
 	s.mu.Lock()
 	conns := s.conns
@@ -93,7 +101,7 @@ func (s *fakeServer) stop() {
 	}
 }
 
-func (s *fakeServer) accept() {
+func (s *fakeJobServer) accept() {
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
@@ -106,7 +114,7 @@ func (s *fakeServer) accept() {
 	}
 }
 
-func (s *fakeServer) serve(conn net.Conn) {
+func (s *fakeJobServer) serve(conn net.Conn) {
 	defer conn.Close()
 	hdr := make([]byte, minPacketLength)
 	for {
@@ -121,20 +129,31 @@ func (s *fakeServer) serve(conn net.Conn) {
 			}
 		}
 
+		// The OPTION_REQ handshake is counted, not recorded as a request: it is
+		// sent by connect() on every connection, so putting it in requests
+		// would shift the index of every job packet the tests assert on. Use
+		// OptionReqs to assert on the handshake itself.
 		s.mu.Lock()
-		s.requests = append(s.requests, req)
+		if req.DataType == dtOptionReq {
+			s.optionReqs++
+		} else {
+			s.requests = append(s.requests, req)
+		}
 		silent := s.silent
 		s.mu.Unlock()
 
-		if silent {
+		if silent && req.DataType != dtOptionReq {
 			continue // record it, answer nothing: drives the timeout paths
 		}
 		s.respond(conn, req)
 	}
 }
 
-func (s *fakeServer) respond(conn net.Conn, req fakeRequest) {
+func (s *fakeJobServer) respond(conn net.Conn, req fakeRequest) {
 	switch req.DataType {
+	case dtOptionReq:
+		writePacket(conn, dtOptionRes, req.Data)
+
 	case dtSubmitJob, dtSubmitJobHigh, dtSubmitJobLow:
 		_, id, payload := req.Job()
 		handle := s.handleFor(id)
@@ -167,7 +186,7 @@ func (s *fakeServer) respond(conn net.Conn, req fakeRequest) {
 
 // handleFor allocates a handle for a unique id, coalescing repeat submissions
 // of the same id onto the same handle as gearmand does.
-func (s *fakeServer) handleFor(id string) string {
+func (s *fakeJobServer) handleFor(id string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if h, ok := s.byId[id]; ok {
@@ -199,7 +218,7 @@ func writePacket(conn net.Conn, dataType uint32, data []byte) {
 // --- knobs -----------------------------------------------------------------
 
 // Requests returns a snapshot of everything received so far.
-func (s *fakeServer) Requests() []fakeRequest {
+func (s *fakeJobServer) Requests() []fakeRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]fakeRequest, len(s.requests))
@@ -207,9 +226,17 @@ func (s *fakeServer) Requests() []fakeRequest {
 	return out
 }
 
+// OptionReqs is how many OPTION_REQ handshakes the server has seen — one per
+// connection the client has opened, redials included.
+func (s *fakeJobServer) OptionReqs() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.optionReqs
+}
+
 // WaitRequests blocks until at least n requests have arrived, and returns a
 // snapshot. It fails the test on timeout rather than blocking forever.
-func (s *fakeServer) WaitRequests(t *testing.T, n int, d time.Duration) []fakeRequest {
+func (s *fakeJobServer) WaitRequests(t *testing.T, n int, d time.Duration) []fakeRequest {
 	t.Helper()
 	deadline := time.Now().Add(d)
 	for {
@@ -226,14 +253,14 @@ func (s *fakeServer) WaitRequests(t *testing.T, n int, d time.Duration) []fakeRe
 
 // SetSilent stops the server answering. Requests are still recorded, so the
 // client is left waiting for a response that never comes.
-func (s *fakeServer) SetSilent(silent bool) {
+func (s *fakeJobServer) SetSilent(silent bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.silent = silent
 }
 
 // SetStatus fixes what GET_STATUS reports for a handle.
-func (s *fakeServer) SetStatus(handle string, st fakeStatus) {
+func (s *fakeJobServer) SetStatus(handle string, st fakeStatus) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status[handle] = st
@@ -241,7 +268,7 @@ func (s *fakeServer) SetStatus(handle string, st fakeStatus) {
 
 // DropConnections hangs up on every live client, as a restarting gearmand
 // would. The listener stays open, so the client can reconnect.
-func (s *fakeServer) DropConnections() {
+func (s *fakeJobServer) DropConnections() {
 	s.mu.Lock()
 	conns := s.conns
 	s.conns = nil
@@ -258,7 +285,7 @@ func (s *fakeServer) DropConnections() {
 // nobody had checked.
 
 func TestFakeServerDo(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	c, err := New(Network, s.Addr())
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +313,7 @@ func TestFakeServerDo(t *testing.T) {
 }
 
 func TestFakeServerDoBgRecordsRequest(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	c, err := New(Network, s.Addr())
 	if err != nil {
 		t.Fatal(err)
@@ -307,7 +334,7 @@ func TestFakeServerDoBgRecordsRequest(t *testing.T) {
 }
 
 func TestFakeServerEcho(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	c, err := New(Network, s.Addr())
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +351,7 @@ func TestFakeServerEcho(t *testing.T) {
 }
 
 func TestFakeServerStatus(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	s.SetStatus("H:fake:7", fakeStatus{Known: true, Running: false, Numerator: 3, Denominator: 9})
 	c, err := New(Network, s.Addr())
 	if err != nil {
@@ -342,7 +369,7 @@ func TestFakeServerStatus(t *testing.T) {
 }
 
 func TestFakeServerSilentDrivesTimeout(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 	s.SetSilent(true)
 	c, err := New(Network, s.Addr())
 	if err != nil {
@@ -365,7 +392,7 @@ func TestFakeServerSilentDrivesTimeout(t *testing.T) {
 // the harness self-tests fail under -race for a reason that has nothing to do
 // with the harness. client/race_test.go covers that race deliberately.
 func TestFakeServerDropConnections(t *testing.T) {
-	s := newFakeServer(t)
+	s := newFakeJobServer(t)
 
 	conn, err := net.Dial(Network, s.Addr())
 	if err != nil {

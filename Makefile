@@ -27,7 +27,11 @@ port_open = bash -c 'exec 3<>/dev/tcp/$(GEARMAND_HOST)/$(GEARMAND_PORT)' 2>/dev/
 # target ignores exactly these and fails on anything new. Matched by file and
 # message, not line: editing either file shifts the line and would otherwise
 # look like a brand new finding.
-VET_BASELINE := client/client\.go:[0-9]+:[0-9]+: unreachable code|client/pool_test\.go:[0-9]+:[0-9]+: unreachable code
+#
+# `^#` drops go's own package headers ("# github.com/sergle/gearman-go/client"
+# and the bracketed test-variant line beside it); they are not findings, and
+# leaving them in made the target fail with the baseline itself as the output.
+VET_BASELINE := ^#|client/client\.go:[0-9]+:[0-9]+: unreachable code|client/pool_test\.go:[0-9]+:[0-9]+: unreachable code
 
 .DEFAULT_GOAL := help
 .PHONY: help build test race vet fmt fmt-check examples knownbugs reproducers \
@@ -38,7 +42,9 @@ help: ## Show this help
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[1m%-14s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "Expected to FAIL until the client races are fixed: race, knownbugs, reproducers."
+	@echo "Expected to FAIL until the remaining client defects are fixed: race, knownbugs, reproducers."
+	@echo "Since the a4b2b37 merge: reproducers fails on TestRaceErrorHandler only,"
+	@echo "knownbugs on 4 tests. Read the per-test output, not just the exit code."
 
 build: ## Compile the library
 	$(GO) build $(PKGS)

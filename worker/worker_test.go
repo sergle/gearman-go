@@ -20,6 +20,11 @@ func init() {
 
 func TestMain(m *testing.M) {
 	integrationsTestFlag := flag.Bool("integration", false, "Run the integration tests (in addition to the unit tests)")
+	// Without this the flag is read before anything parses it, so
+	// runIntegrationTests is always false and every worker integration test
+	// skips even when -integration is given. client/client_test.go parses; this
+	// file did not.
+	flag.Parse()
 	if integrationsTestFlag != nil {
 		runIntegrationTests = *integrationsTestFlag
 	}
