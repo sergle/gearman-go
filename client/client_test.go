@@ -18,13 +18,23 @@ const (
 var (
 	client              *Client
 	runIntegrationTests bool
+	runKnownBugTests    bool
+	runPerlWorkerTests  bool
 )
 
 func TestMain(m *testing.M) {
 	integrationsTestFlag := flag.Bool("integration", false, "Run the integration tests (in addition to the unit tests)")
+	knownBugsFlag := flag.Bool("knownbugs", false, "Run the tests for known unfixed defects (they are expected to fail)")
+	perlWorkerFlag := flag.Bool("perlworker", false, "Run tests that need example/pl/worker_multi.pl running against the job server")
 	flag.Parse()
 	if integrationsTestFlag != nil {
 		runIntegrationTests = *integrationsTestFlag
+	}
+	if knownBugsFlag != nil {
+		runKnownBugTests = *knownBugsFlag
+	}
+	if perlWorkerFlag != nil {
+		runPerlWorkerTests = *perlWorkerFlag
 	}
 	code := m.Run()
 	os.Exit(code)
@@ -274,11 +284,18 @@ func TestClientMultiDo(t *testing.T) {
 		t.Skip("To run this test, use: go test -integration")
 	}
 
-	// This integration test requires that examples/pl/worker_multi.pl be running.
+	// This test needs a worker registered for "PerlToUpper" — example/pl/
+	// worker_multi.pl — in addition to the job server. A bare gearmand can
+	// never satisfy it: the 1000 submits below block waiting for results that
+	// nobody will produce, and the package hits its global test timeout, which
+	// discards every other result too. Hence its own gate.
 	//
-	// Test invocation is:
-	//    go test -integration -timeout 10s -run '^TestClient(AddServer|MultiDo)$'
-	//
+	//    example/pl/worker_multi.pl &
+	//    go test ./client -integration -perlworker -run '^TestClient(AddServer|MultiDo)$'
+	if !runPerlWorkerTests {
+		t.Skip("needs example/pl/worker_multi.pl running; use: go test ./client -integration -perlworker")
+	}
+
 	// Send 1000 requests to go through all race conditions
 	const nreqs = 1000
 	errCh := make(chan error)
