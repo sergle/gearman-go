@@ -112,15 +112,12 @@ func (pool *Pool) DoBg(funcname string, data []byte,
 	return
 }
 
-// Status gets job status from job server.
-// Unlike Do, this does take the client's mutex: (*Client).Status writes to the
-// connection without holding it, so this is the only thing keeping concurrent
-// callers from interleaving their bytes on the shared writer.
+// Status gets job status from job server. Does not lock the client, for the
+// same reason as Do: (*Client).Status takes that mutex itself and holds it
+// until the job server answers.
 // !!!Not fully tested.!!!
 func (pool *Pool) Status(addr, handle string) (status *Status, err error) {
 	if client, ok := pool.Clients[addr]; ok {
-		client.Lock()
-		defer client.Unlock()
 		status, err = client.Status(handle)
 	} else {
 		err = ErrNotFound
@@ -128,8 +125,8 @@ func (pool *Pool) Status(addr, handle string) (status *Status, err error) {
 	return
 }
 
-// Send a something out, get the samething back.
-// Takes the client's mutex for the same reason as Status, not Do.
+// Send a something out, get the samething back. Does not lock the client; see
+// the note on Do.
 func (pool *Pool) Echo(addr string, data []byte) (echo []byte, err error) {
 	var client *PoolClient
 	if addr == "" {
@@ -141,8 +138,6 @@ func (pool *Pool) Echo(addr string, data []byte) (echo []byte, err error) {
 			return
 		}
 	}
-	client.Lock()
-	defer client.Unlock()
 	echo, err = client.Echo(data)
 	return
 }

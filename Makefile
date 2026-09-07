@@ -17,7 +17,7 @@ TIMEOUT ?= 120s
 # Benchmark knobs. BENCHTIME is a fixed iteration count rather than a duration
 # so a run is comparable across machines and across a code change; BENCHCOUNT
 # is above 1 on purpose, because a single run is not evidence for anything
-# concurrent (see docs/race_plan.md).
+# concurrent -- the spread between runs is wider than the effects measured.
 BENCH         ?= .
 BENCHTIME     ?= 2000x
 BENCHCOUNT    ?= 10
@@ -54,7 +54,7 @@ help: ## Show this help
 	@echo "race, knownbugs and reproducers exist to FAIL while the defects they"
 	@echo "describe are open; bench fails the cases whose defect wedges them."
 	@echo "Read the per-test output, not the exit code -- which cases fail is the"
-	@echo "signal, and it changes as fixes land. See docs/ for the defect notes."
+	@echo "signal, and it changes as fixes land. Each test comments its own defect."
 
 build: ## Compile the library
 	$(GO) build $(PKGS)
@@ -66,9 +66,10 @@ test: ## Run the default test suite (no gearmand needed)
 # check: `go test` skips benchmarks unless -bench is given, so the new files
 # cost the default suite nothing but a compile.
 #
-# BenchmarkClientMixedDoAndEcho is expected to FAIL until todo.md sections 4
-# and 5 are fixed: interleaved writes lose the framing and Echo has no timeout,
-# so it wedges and its watchdog fires. Everything else reports a number.
+# Every case reports a number today. BenchmarkClientMixedDoAndEcho used to wedge
+# and fail its watchdog: Echo wrote to the shared bufio.Writer unlocked, then
+# waited on a latch with no timeout. It now measures the serialisation its fix
+# introduced -- Do and Echo no longer overlap.
 bench: ## Run the benchmarks against the in-process fake servers (no gearmand)
 	$(GO) test -run xxx -bench '$(BENCH)' -benchtime $(BENCHTIME) \
 	  -count $(BENCHCOUNT) -benchmem -timeout $(BENCH_TIMEOUT) ./client ./worker

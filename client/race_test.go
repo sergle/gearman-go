@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// These tests reproduce the data races documented in docs/todo.md. They carry
+// These tests reproduce the client's known data races. They carry
 // no assertions of their own: the race detector is the oracle, and a reported
 // race fails the test binary. Without -race they pass trivially, so they must
 // be run as:
@@ -53,10 +53,10 @@ func hostileServer(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// TestRaceErrorHandler covers todo.md section 1: readLoop reads
-// client.ErrorHandler at client.go:200, but New starts readLoop at
-// client.go:85 before it returns, so the documented way to install a handler
-// always races the goroutine that reads it.
+// TestRaceErrorHandler: err() reads client.ErrorHandler from readLoop, which
+// New starts before it returns. The only documented way to install a handler is
+// to assign the field afterwards, so the documented usage always races that
+// read. An API flaw, not a missing lock — still open, so this one fails.
 func TestRaceErrorHandler(t *testing.T) {
 	addr := hostileServer(t)
 
@@ -72,9 +72,10 @@ func TestRaceErrorHandler(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 }
 
-// TestRaceCloseDuringRedial covers todo.md section 2: Close writes conn at
-// client.go:320 under client.Mutex while readLoop's internal re-dial reads it
-// at client.go:124 and writes it at client.go:140 holding nothing.
+// TestRaceCloseDuringRedial: Close used to write conn under client.Mutex while
+// readLoop's internal re-dial read and wrote it holding nothing. Fixed upstream
+// — conn and rw are connMu's now — so this passes, and stays as its regression
+// test.
 func TestRaceCloseDuringRedial(t *testing.T) {
 	addr := hostileServer(t)
 
@@ -88,9 +89,9 @@ func TestRaceCloseDuringRedial(t *testing.T) {
 	}
 }
 
-// TestRaceWriteDuringRedial covers todo.md section 3: do -> write uses rw
-// under client.Mutex while readLoop's re-dial replaces it at
-// client.go:145-146 under no lock at all.
+// TestRaceWriteDuringRedial: do -> write used rw under client.Mutex while
+// readLoop's re-dial replaced it under no lock. Fixed by the same connMu
+// change; kept as its regression test.
 func TestRaceWriteDuringRedial(t *testing.T) {
 	addr := hostileServer(t)
 

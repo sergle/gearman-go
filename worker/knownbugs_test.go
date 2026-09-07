@@ -26,9 +26,8 @@ func requireWorkerKnownBugs(t *testing.T) {
 	}
 }
 
-// todo.md section 10: agent.read assumes every read starts on a packet
-// boundary and that the first read delivers at least a 12-byte header. Neither
-// holds on a stream socket.
+// agent.read assumes every read starts on a packet boundary and that the first
+// read delivers at least a 12-byte header. Neither holds on a stream socket.
 //
 //	tmp := getBuffer(bufferSize)
 //	n, err = a.rw.Read(tmp)

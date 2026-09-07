@@ -1,8 +1,6 @@
 package client
 
 import (
-	"fmt"
-	"sync"
 	"testing"
 	"time"
 )
@@ -52,120 +50,20 @@ func mustReturnWithin(t *testing.T, d time.Duration, what string, fn func() erro
 	}
 }
 
-// todo.md section 4: Status and Echo call client.write without holding
-// client.Mutex, so they scribble into the same bufio.Writer as a concurrent
-// do(). Fails under -race with writes colliding at client.go:94 (do -> write)
-// and client.go:309 (Echo).
+// The tests for Status and Echo -- writing without client.Mutex, and blocking
+// forever with no timeout -- moved to liveness_test.go when the fix landed.
+// They run ungated now, as regression tests.
 //
-// Only one Echo is in flight at a time here, to keep this about the write race
-// rather than the handler clobbering covered below.
-//
-// Fixed by: Phase 5 (hold client.Mutex around the Status and Echo writes).
-func TestConcurrentSubmitAndEchoDoNotCorruptTheStream(t *testing.T) {
-	requireKnownBugs(t)
-
-	s := newFakeJobServer(t)
-	c := newTestClient(t, s)
-	c.ResponseTimeout = 200 * time.Millisecond
-
-	const n = 20
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() { // submits, serialised among themselves by do()'s lock
-			defer wg.Done()
-			for i := 0; i < n; i++ {
-				c.DoBgWithId("f", []byte("payload"), JobNormal, fmt.Sprintf("id-%d", i))
-			}
-		}()
-		go func() { // echoes, one at a time, taking no lock at all
-			defer wg.Done()
-			for i := 0; i < n; i++ {
-				c.Echo([]byte("ping"))
-			}
-		}()
-		wg.Wait()
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("interleaved writes wedged the connection")
-	}
-
-	// Whatever arrived must be well-formed: interleaved writes corrupt the
-	// framing, so a garbled body is the defect showing up without -race.
-	for i, req := range s.Requests() {
-		switch req.DataType {
-		case dtSubmitJobBg:
-			if fn, _, _ := req.Job(); fn != "f" {
-				t.Errorf("request %d: corrupted submit body %q", i, req.Data)
-			}
-		case dtEchoReq:
-			if string(req.Data) != "ping" {
-				t.Errorf("request %d: corrupted echo body %q", i, req.Data)
-			}
-		default:
-			t.Errorf("request %d: unexpected opcode %d (framing lost)", i, req.DataType)
-		}
-	}
-}
-
-// todo.md section 5: Echo blocks forever when no response arrives. It uses a
-// locked-twice sync.Mutex as a latch with no timeout, unlike do(), which has
-// ResponseTimeout.
-//
-// Fixed by: Phase 5 (chan + ResponseTimeout select, removing the inner handler
-// on timeout).
-func TestEchoTimesOutWhenServerNeverAnswers(t *testing.T) {
-	requireKnownBugs(t)
-
-	s := newFakeJobServer(t)
-	s.SetSilent(true)
-	c := newTestClient(t, s)
-	c.ResponseTimeout = 100 * time.Millisecond
-
-	err := mustReturnWithin(t, 2*time.Second, "Echo", func() error {
-		_, err := c.Echo([]byte("ping"))
-		return err
-	})
-	if err != ErrLostConn {
-		t.Errorf("Echo err = %v, want ErrLostConn", err)
-	}
-}
-
-// todo.md section 5, the same defect in Status.
-//
-// Fixed by: Phase 5.
-func TestStatusTimesOutWhenServerNeverAnswers(t *testing.T) {
-	requireKnownBugs(t)
-
-	s := newFakeJobServer(t)
-	s.SetSilent(true)
-	c := newTestClient(t, s)
-	c.ResponseTimeout = 100 * time.Millisecond
-
-	err := mustReturnWithin(t, 2*time.Second, "Status", func() error {
-		_, err := c.Status("H:fake:1")
-		return err
-	})
-	if err != ErrLostConn {
-		t.Errorf("Status err = %v, want ErrLostConn", err)
-	}
-}
-
 // The Pool.Do / Pool.DoBg deadlock tests that used to live here were deleted
 // when the upstream merge (7341bb3) fixed the defect: upstream's own
 // pool_deadlock_test.go covers both calls, asserts the returned handle, and
 // runs in the default suite rather than behind -knownbugs — which is where a
 // fixed defect's regression test belongs.
 //
-// todo.md section 6: Pool.selectServer (pool.go:157-166) spins forever when the
-// pool is empty. SelectWithRate returns pool.last ("") with nothing to choose
-// from, the map lookup misses, and `for client == nil` goes round again. Pool
-// already defines ErrNotFound for exactly this case.
+// Pool.selectServer spins forever on an empty pool: SelectWithRate returns
+// pool.last ("") with nothing to choose from, the map lookup misses, and
+// `for client == nil` goes round again. ErrNotFound already exists for this.
+// SelectRandom has the same precondition and panics instead, via rand.Intn(0).
 //
 // Reached in practice by `make integration` with no gearmand: every Pool.Add
 // fails, so the pool is empty by the time a Pool.Echo runs.
@@ -174,7 +72,7 @@ func TestStatusTimesOutWhenServerNeverAnswers(t *testing.T) {
 // not blocked — it burns a core for the rest of the test binary's life. That is
 // the defect, and the reason this test is gated rather than run by default.
 //
-// Fixed by: Phase 6 (return ErrNotFound instead of looping).
+// Fix: return ErrNotFound instead of looping.
 func TestPoolOnEmptyPoolReturnsNotFound(t *testing.T) {
 	requireKnownBugs(t)
 

@@ -207,6 +207,17 @@ func TestSameIdYieldsSameHandle(t *testing.T) {
 
 // Close can be called repeatedly, and afterwards every request-sending method
 // reports the connection is gone rather than panicking or hanging.
+//
+// FLAKY, and the flake is a real defect rather than a bad test. Closing makes
+// readLoop's read fail, and its error path closes and then *reconnects* --
+// nothing records that the caller shut this client down. If the redial wins,
+// getConn() is non-nil again and DoBg, Status and Echo succeed against a
+// resurrected connection instead of returning ErrLostConn.
+//
+// 3 failing subtest assertions per 50 runs under -race, 0 per 50 without: the
+// detector slows the test goroutine enough for the redial to land first. Do not
+// relax the assertion -- ErrLostConn after Close is the contract. It goes away
+// when the internal redial does.
 func TestCloseIsIdempotentAndSubsequentCallsFail(t *testing.T) {
 	s := newFakeJobServer(t)
 	c := newTestClient(t, s)

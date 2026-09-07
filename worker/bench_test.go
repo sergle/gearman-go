@@ -17,9 +17,9 @@ import (
 // ns/op is therefore pipeline latency per job at a queue depth of one -- the
 // worker grabs again as soon as it dispatches (worker.go:157), so there is
 // exactly one assignment in flight. It is not a saturation number, and it is
-// not meant to be: the fixes in docs/ai/liveness_fix.md are all client-side,
-// so this side exists as a *control*. If these move, the change leaked out of
-// the client package.
+// not meant to be: the Status/Echo locking and timeout work is all
+// client-side, so this side exists as a *control*. If these move, the change
+// leaked out of the client package.
 //
 // The allocation figures are per iteration of the benchmark loop, but the work
 // happens on the worker's goroutines, so ReportAllocs here measures the
@@ -66,7 +66,7 @@ func BenchmarkWorkerJobPipeline(b *testing.B) {
 
 // There is deliberately no large-payload variant here. Anything that makes a
 // JOB_ASSIGN arrive in more than one read trips the framing defect in
-// agent.read (todo.md section 10) and the pipeline stalls, so such a benchmark
+// agent.read and the pipeline stalls, so such a benchmark
 // would report a stall rather than a number. The defect has a deterministic
 // reproducer instead: TestAgentReadReturnsWholePackets in knownbugs_test.go.
 

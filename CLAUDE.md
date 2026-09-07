@@ -39,11 +39,14 @@ go test -run TestClientDo ./client    # single test
 `make reproducers` exist to fail: each one runs tests that describe behaviour
 the code does not have yet, so a red run is the expected state and making one
 green by weakening its test defeats the point. Which cases fail changes as
-fixes land, so read the per-test output rather than the exit code. The
-per-defect notes live in `docs/`.
+fixes land, so read the per-test output rather than the exit code. Each test
+carries the defect it describes in its own comment.
 
 `make bench` is the same bargain in benchmark form: a case whose defect makes
-it wedge fails its watchdog instead of reporting a number. Benchmarks run
+it wedge fails its watchdog instead of reporting a number. Every case reports a
+number today — `BenchmarkClientMixedDoAndEcho` was the one that did not, until
+`Status` and `Echo` got the write lock and a timeout — so the watchdogs are now
+regression guards. Benchmarks run
 against the in-process fake servers, need no gearmand, and are not part of
 `make check` — `go test` skips them unless `-bench` is given, so the default
 suite pays only the compile. `BENCH`, `BENCHTIME`, `BENCHCOUNT` and
@@ -138,6 +141,12 @@ call a blocking method on the test goroutine — each goes through
 hanging defect fails one test instead of wedging the binary until its global
 timeout kills every other result too.
 
+When a defect is fixed, its test moves into the default suite as a regression
+test and the gate comes off. `client/liveness_test.go` is where the
+`Status`/`Echo` locking and timeout tests went; they still use
+`mustReturnWithin` from `knownbugs_test.go`, same package, because a regression
+hangs rather than fails.
+
 `worker/worker_racy_test.go` is the exception: it is not gated, but passes
 vacuously without a server because `AddServer` does not dial and `Ready`'s
 error is only printed.
@@ -178,21 +187,32 @@ Responses are correlated by a **fixed key**, not by request identity:
 `rhandlers` map keyed by the real job handle once the server assigns one
 (`handleInner`, `client.go:368`).
 
-That single `"c"` slot is why `do` holds `client.Mutex` across the **entire**
-round trip — write, then block on the result channel until `processLoop`
-delivers or `ResponseTimeout` fires. The invariant this creates governs the
-whole file:
+Those fixed slots are why `do`, `Status` and `Echo` each hold `client.Mutex`
+across the **entire** round trip — write, then block on the result channel
+until `processLoop` delivers or `ResponseTimeout` fires. The same mutex
+serialises the one shared `bufio.Writer`:
+
+> Every `client.write` call site holds `client.Mutex`. `connect()` is the only
+> exception, and only because its `rw` is not published by `setConn` yet.
+
+So a `Do` and an `Echo` on one `Client` cannot overlap at all — deliberately.
+The invariant this creates governs the whole file:
 
 > `readLoop` and `processLoop` must never take `client.Mutex`. If they do, they
-> cannot deliver the response that `do` is holding the lock waiting for.
+> cannot deliver the response the caller is holding the lock waiting for.
 
-`client.go:267` breaks it: `readLoop` calls `Close()`, which locks. Connection
-state therefore has its own lock, `connMu` (`client.go:55`), reached through
+Connection state therefore has its own lock, `connMu`, reached through
 `getConn` / `getRW` / `setConn` and held only around load/store, never across
-I/O. Do not reuse `client.Mutex` for it — that deadlocks.
+I/O. Do not reuse `client.Mutex` for it — that deadlocks. `Close` takes
+`connMu` only, via `closeConn`, and `readLoop` closes through `closeConn`
+rather than `Close`, for the same reason: `client.Mutex` there would stall the
+re-dial for a whole `ResponseTimeout`, and the caller's response can only
+arrive over the connection being rebuilt.
 
-`readLoop` also re-dials internally on error (`client.go:262-277`), so a
-connection the caller closed can come back.
+`readLoop` also re-dials internally on error, so a connection the caller closed
+can come back: it closes, reconnects, loops — and the loop condition passes
+because it just reconnected. There is no `closed` flag. Known and still open;
+a clean `-race` run does not mean this is resolved.
 
 `Pool` wraps N clients with a `SelectionHandler` for server selection. It is
 not a connection pool to one server.

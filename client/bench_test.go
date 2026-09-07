@@ -9,26 +9,25 @@ import (
 // Benchmarks for the client's request paths, driven by the in-process fake job
 // server (fakeserver_test.go) over a real loopback socket. No gearmand.
 //
-// They exist to give the fixes in docs/ai/liveness_fix.md a *before* number.
-// Two things that plan changes are measurable here:
+// They were written for a *before* number on the Status/Echo locking-and-timeout
+// change, and still watch two of its effects:
 //
-//   - Status and Echo grow a per-call timeout. Today they park on a
-//     two-operation sync.Mutex latch and allocate nothing for it; a
-//     time.After per call would show up in ReportAllocs, and time.After keeps
-//     its timer alive for the whole ResponseTimeout even when the response
-//     arrives immediately. Compare BenchmarkClientEcho / BenchmarkClientStatus
-//     across the fix; if the allocation shows, use time.NewTimer with a Stop
-//     instead of copying do()'s time.After.
+//   - Status and Echo carry a per-call timeout. They used to park on a
+//     sync.Mutex latch, allocating nothing; each now allocates a result
+//     channel, a closure and a timer. Both timer constructors allocate one
+//     Timer, so ReportAllocs cannot tell them apart -- they use NewTimer with
+//     a Stop because an unstopped time.After timer stays live for the whole
+//     ResponseTimeout after a round trip of microseconds. do() still uses
+//     time.After.
 //
-//   - Do and Echo stop overlapping, because both will hold client.Mutex for
-//     the whole round trip. BenchmarkClientDoBgParallel measures contention on
-//     the submit path alone; BenchmarkClientMixedDoAndEcho is the mixed case,
-//     and today it does not finish at all (see its comment).
+//   - Do and Echo no longer overlap: both hold client.Mutex for the whole
+//     round trip. DoBgParallel measures contention on the submit path alone;
+//     MixedDoAndEcho is the mixed case, and used not to finish (see it).
 //
-// Every benchmark runs the loopback socket and one client goroutine pair, so
-// the numbers are dominated by syscalls and scheduling, not by the client's
-// arithmetic. That is fine: the questions above are about serialisation and
-// allocation per call, both of which survive that noise.
+// Every benchmark runs a loopback socket and one client goroutine pair, so the
+// numbers are dominated by syscalls and scheduling, not the client's
+// arithmetic. Fine: the questions above are serialisation and allocation per
+// call, both of which survive that noise.
 //
 // Run with: make bench
 
@@ -105,8 +104,9 @@ func BenchmarkClientDoBgLargePayload(b *testing.B) {
 	b.StopTimer()
 }
 
-// BenchmarkClientEcho is one of the two calls docs/ai/liveness_fix.md rewrites.
-// Baseline: the sync.Mutex latch, no timer, no lock around the write.
+// BenchmarkClientEcho is one of the two calls the locking-and-timeout change
+// rewrote. Its recorded baseline used the old shape: a sync.Mutex latch, no
+// timer, no lock around the write.
 func BenchmarkClientEcho(b *testing.B) {
 	s := newBenchServer(b)
 	c := newTestClient(b, s)
@@ -121,8 +121,8 @@ func BenchmarkClientEcho(b *testing.B) {
 	b.StopTimer()
 }
 
-// BenchmarkClientStatus is the other one. Same baseline, plus the STATUS_RES
-// parse.
+// BenchmarkClientStatus is the other one. Same baseline shape, plus the
+// STATUS_RES parse.
 func BenchmarkClientStatus(b *testing.B) {
 	s := newBenchServer(b)
 	c := newTestClient(b, s)
@@ -138,9 +138,9 @@ func BenchmarkClientStatus(b *testing.B) {
 }
 
 // BenchmarkClientDoBgParallel submits from GOMAXPROCS goroutines at once. do()
-// already holds client.Mutex for the whole round trip, so this is a
-// serialisation number, not a throughput one -- and it is the number to
-// re-measure after Status and Echo join that same lock.
+// holds client.Mutex for the whole round trip, so this is a serialisation
+// number, not a throughput one -- and since Status and Echo joined that lock,
+// the one every path shares.
 func BenchmarkClientDoBgParallel(b *testing.B) {
 	s := newBenchServer(b)
 	c := newTestClient(b, s)
@@ -160,15 +160,14 @@ func BenchmarkClientDoBgParallel(b *testing.B) {
 
 // BenchmarkClientMixedDoAndEcho submits and echoes concurrently.
 //
-// It does not produce a number today, and that is the measurement: Echo writes
-// to the shared bufio.Writer without holding client.Mutex (todo.md section 4),
-// so its bytes interleave with a concurrent submit and destroy the framing;
-// then Echo waits on a latch with no timeout (section 5) for a response that
-// can never arrive. The watchdog below turns that into a failed benchmark
-// rather than a wedged `make bench`.
+// It used not to produce a number at all, and that was the measurement: Echo
+// wrote to the shared bufio.Writer unlocked, interleaving its bytes with a
+// concurrent submit and destroying the framing, then waited on a latch with no
+// timeout for a response that could never arrive. The watchdog below fired.
 //
-// After the fix it becomes the throughput number for the serialisation that
-// fix introduces -- Do and Echo can no longer overlap at all.
+// Both fixed, so it now measures the serialisation that fix introduced -- Do
+// and Echo no longer overlap. The watchdog stays: it turns a regression into a
+// failed benchmark rather than a wedged `make bench`.
 func BenchmarkClientMixedDoAndEcho(b *testing.B) {
 	s := newBenchServer(b)
 	c := newTestClient(b, s)
@@ -240,7 +239,7 @@ func BenchmarkClientMixedDoAndEcho(b *testing.B) {
 		}
 	case <-time.After(deadline):
 		b.StopTimer()
-		b.Fatal("wedged: interleaved writes lost the framing and Echo has no timeout" +
-			" (todo.md sections 4 and 5) -- no baseline number is available before the fix")
+		b.Fatal("wedged: interleaved writes lost the framing, or Echo is waiting" +
+			" on a response with no timeout -- both were fixed, so this is a regression")
 	}
 }

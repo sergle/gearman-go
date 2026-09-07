@@ -65,7 +65,9 @@ type Client struct {
 	// atomic. Also not guarded by connMu.
 	exceptionsState int32
 
-	ResponseTimeout time.Duration // response timeout for do()
+	// ResponseTimeout bounds the wait for a response in do(), Status() and
+	// Echo(). All three return ErrLostConn when it fires.
+	ResponseTimeout time.Duration
 
 	ErrorHandler ErrorHandler
 }
@@ -199,6 +201,12 @@ func (client *Client) connect() (err error) {
 	return
 }
 
+// write encodes and sends one request on the current connection.
+//
+// Invariant: every caller holds client.Mutex -- do(), Status(), Echo(). They
+// share one bufio.Writer, so an unlocked write interleaves its bytes with a
+// concurrent request and destroys the framing. connect() is the one exception:
+// its rw is not published by setConn yet, so nothing else can reach it.
 func (client *Client) write(req *request) (err error) {
 	rw := client.getRW()
 	if rw == nil {
@@ -264,7 +272,12 @@ ReadLoop:
 			// closed by Gearmand, the client should close the conection
 			// and reconnect to job server. connect() re-negotiates the
 			// "exceptions" option, which the server holds per connection.
-			client.Close()
+			//
+			// closeConn, not Close: callers hold client.Mutex for a whole
+			// round trip, so taking it here would stall the re-dial until
+			// their ResponseTimeout fired -- and their response can only
+			// arrive over the connection this loop is rebuilding.
+			client.closeConn()
 			if err = client.connect(); err != nil {
 				client.err(err)
 				break
@@ -432,52 +445,94 @@ func (client *Client) DoBg(funcname string, data []byte,
 	return
 }
 
+type statusOrError struct {
+	status *Status
+	err    error
+}
+
 // Status gets job status from job server.
+//
+// Like do(), it holds client.Mutex for the whole round trip: shared writer,
+// and a response keyed "s"+handle rather than correlated with this call. Hence
+// Pool.Status must not lock the client too -- sync.Mutex is not reentrant.
+//
+// A response that never arrives gives up after ResponseTimeout with
+// ErrLostConn instead of blocking forever.
 func (client *Client) Status(handle string) (status *Status, err error) {
 	if client.getConn() == nil {
 		return nil, ErrLostConn
 	}
-	var mutex sync.Mutex
-	mutex.Lock()
-	client.innerHandler.put("s"+handle, func(resp *Response) {
-		defer mutex.Unlock()
-		var err error
-		status, err = resp._status()
-		if err != nil {
-			client.err(err)
-		}
+	// Buffered: a response arriving after the timeout is dropped rather than
+	// parking processLoop on a send nobody will receive.
+	var result = make(chan statusOrError, 1)
+	key := "s" + handle
+	client.Lock()
+	defer client.Unlock()
+	client.innerHandler.put(key, func(resp *Response) {
+		st, serr := resp._status()
+		result <- statusOrError{st, serr}
 	})
 	req := getRequest()
 	req.DataType = dtGetStatus
 	req.Data = []byte(handle)
-	client.write(req)
-	mutex.Lock()
-	return
+	if err = client.write(req); err != nil {
+		client.innerHandler.remove(key)
+		return nil, err
+	}
+	// NewTimer with a Stop, not time.After: a round trip is microseconds
+	// against a default of a second, and an unstopped time.After timer stays
+	// live for all of it. do() predates this and still uses time.After.
+	timer := time.NewTimer(client.ResponseTimeout)
+	defer timer.Stop()
+	select {
+	case ret := <-result:
+		// A malformed STATUS_RES goes to the caller, not ErrorHandler: they
+		// asked, and reporting both ways fires the handler needlessly.
+		return ret.status, ret.err
+	case <-timer.C:
+		client.innerHandler.remove(key)
+		return nil, ErrLostConn
+	}
 }
 
-// Echo.
+// Echo sends something out and gets the same thing back. Locking and timeout
+// as in Status; ECHO_RES carries no correlation id, so the "e" slot holds at
+// most one echo in flight.
 func (client *Client) Echo(data []byte) (echo []byte, err error) {
 	if client.getConn() == nil {
 		return nil, ErrLostConn
 	}
-	var mutex sync.Mutex
-	mutex.Lock()
+	var result = make(chan []byte, 1) // buffered, see Status
+	client.Lock()
+	defer client.Unlock()
 	client.innerHandler.put("e", func(resp *Response) {
-		echo = resp.Data
-		mutex.Unlock()
+		result <- resp.Data
 	})
 	req := getRequest()
 	req.DataType = dtEchoReq
 	req.Data = data
-	client.write(req)
-	mutex.Lock()
-	return
+	if err = client.write(req); err != nil {
+		client.innerHandler.remove("e")
+		return nil, err
+	}
+	timer := time.NewTimer(client.ResponseTimeout) // stopped, see Status
+	defer timer.Stop()
+	select {
+	case ret := <-result:
+		return ret, nil
+	case <-timer.C:
+		client.innerHandler.remove("e")
+		return nil, ErrLostConn
+	}
 }
 
-// Close connection
-func (client *Client) Close() (err error) {
-	client.Lock()
-	defer client.Unlock()
+// closeConn drops the current connection, taking connMu and nothing else:
+// readLoop calls it, and client.Mutex is held across whole round trips.
+//
+// conn and rw are all it touches and both are connMu's property. A concurrent
+// write took its rw snapshot through getRW() and either writes to a closed
+// connection (an error) or finds nil (ErrLostConn). Idempotent.
+func (client *Client) closeConn() (err error) {
 	client.connMu.Lock()
 	defer client.connMu.Unlock()
 	if client.conn != nil {
@@ -486,6 +541,13 @@ func (client *Client) Close() (err error) {
 		client.rw = nil
 	}
 	return
+}
+
+// Close connection. Deliberately not on client.Mutex: Status and Echo hold it
+// until their response or ResponseTimeout, so locking here would make Close
+// wait out an in-flight request instead of cutting it short.
+func (client *Client) Close() (err error) {
+	return client.closeConn()
 }
 
 // Call the function and get a response.

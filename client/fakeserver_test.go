@@ -416,10 +416,12 @@ func TestFakeServerSilentDrivesTimeout(t *testing.T) {
 }
 
 // Driven over a raw socket rather than through Client on purpose. Dropping the
-// connection sends the real client into readLoop's re-dial, which is itself a
-// known data race (todo.md section 2) — running this through Client would make
-// the harness self-tests fail under -race for a reason that has nothing to do
-// with the harness. client/race_test.go covers that race deliberately.
+// connection sends the real client into readLoop's re-dial, which used to be a
+// data race in the conn/rw handover — running this through Client would have
+// failed the harness self-tests under -race for a reason unrelated to the
+// harness. That race is fixed, but the point stands: these tests prove the fake
+// server speaks the protocol, so they must not lean on Client's reconnect path.
+// race_test.go drives that deliberately.
 func TestFakeServerDropConnections(t *testing.T) {
 	s := newFakeJobServer(t)
 
