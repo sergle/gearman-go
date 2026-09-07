@@ -145,7 +145,14 @@ When a defect is fixed, its test moves into the default suite as a regression
 test and the gate comes off. `client/liveness_test.go` is where the
 `Status`/`Echo` locking and timeout tests went; they still use
 `mustReturnWithin` from `knownbugs_test.go`, same package, because a regression
-hangs rather than fails.
+hangs rather than fails. `worker/framing_test.go` is the worker's equivalent —
+the `agent.read` framing tests — with its own `readWithin` for the same reason.
+
+`worker/knownbugs_test.go` is therefore **empty of tests** right now, and stays
+on disk deliberately: `make knownbugs` passes `-knownbugs` to `./client` and
+`./worker` both, so `worker/worker_test.go` must keep defining the flag or that
+run dies with "flag provided but not defined", and `requireWorkerKnownBugs` is
+the hook the next worker-side defect uses.
 
 `worker/worker_racy_test.go` is the exception: it is not gated, but passes
 vacuously without a server because `AddServer` does not dial and `Ready`'s
@@ -229,9 +236,34 @@ Concurrency is capped by the `limit` buffered channel: `New(OneByOne)` gives
 capacity 0, `New(Unlimited)` leaves it nil (uncapped). A token is pushed in
 `handleInPack` and popped in `exec`'s defer.
 
-Unlike the client, `agent.read` (`worker/agent.go:174`) frames by reading the
-declared length out of the header, so it does not need the client's `leftdata`
-dance.
+Unlike the client, `agent.read` (`worker/agent.go:179`) frames each packet
+itself rather than re-parsing a buffer: `io.ReadFull` for the 12-byte header,
+then `io.ReadFull` of exactly the body length the header declares. It returns
+one whole packet or an error with `nil` data — never a fragment, never bytes
+belonging to the next packet — so `work()` has no `leftdata` tail to carry
+between iterations and must not grow one. It also rejects a body over
+`maxPacketLength` (64 MiB, `worker/common.go`) and a header whose magic is not
+`\x00RES`; both are how a desynced stream fails fast now that the body is
+pre-allocated from the declared length. Those go through `work()`'s generic
+branch — report, `Close`, redial, `continue` — because a desynced stream cannot
+be resynchronised in place.
+
+`io.EOF` and `io.ErrUnexpectedEOF` must **not**: `work()` routes both to
+`disconnect_error`, and the distinction matters because the generic branch
+redials without calling `reRegisterFuncsForAgent` or `grab()`. An agent sent
+there comes back with a live socket, no announced abilities and nothing
+outstanding — silently idle. Only `*WorkerDisconnectError` reaches
+`ErrorHandler`, and only the caller's `.Reconnect()` re-registers.
+`io.ReadFull` reports a connection that died mid-packet as
+`io.ErrUnexpectedEOF` where a bare `Read` reported `io.EOF`, so framing by
+declared length has to name it explicitly.
+`worker/framing_test.go`'s `TestAgentWorkTruncatedPacketDisconnects` guards
+that routing; the rest of the file guards `read` itself.
+
+This was not always true: `read` used to take the length from a single `Read`,
+which returned a fragment when that read was shorter than a header and then
+framed from four payload bytes for the rest of the connection. The worker
+silently stopped grabbing. `worker/framing_test.go` guards it.
 
 Reconnect is caller-driven: a dropped connection surfaces as
 `*WorkerDisconnectError` passed to `ErrorHandler`, and the handler calls

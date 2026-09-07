@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"testing"
 	"time"
 )
@@ -64,11 +65,25 @@ func BenchmarkWorkerJobPipeline(b *testing.B) {
 	b.StopTimer()
 }
 
-// There is deliberately no large-payload variant here. Anything that makes a
-// JOB_ASSIGN arrive in more than one read trips the framing defect in
-// agent.read and the pipeline stalls, so such a benchmark
-// would report a stall rather than a number. The defect has a deterministic
-// reproducer instead: TestAgentReadReturnsWholePackets in knownbugs_test.go.
+// BenchmarkWorkerJobPipelineLargePayload is a regression guard as much as a
+// measurement: 64 KiB cannot arrive in one read, which is the case that used to
+// stall the pipeline outright rather than report a number. A regression fires
+// runJobs' watchdog instead of printing a slow result.
+//
+// Non-zero bytes, because an all-zero payload mis-frames to a length of 0 and
+// returns immediately -- the defect only shows with content.
+func BenchmarkWorkerJobPipelineLargePayload(b *testing.B) {
+	s := newFakeWorkerServer(b)
+	s.SetRecord(false)
+	s.SetJob("bench", bytes.Repeat([]byte("x"), 64<<10))
+	newTestWorker(b, s, "bench", func(job Job) ([]byte, error) {
+		return nil, nil
+	})
+
+	b.ResetTimer()
+	runJobs(b, s, b.N)
+	b.StopTimer()
+}
 
 // BenchmarkWorkerJobPipelineEcho sends the payload back, so WORK_COMPLETE
 // carries a body and the write path is exercised in both directions.

@@ -78,8 +78,7 @@ func (worker *Worker) broadcast(outpack *outPack) {
 
 // AddFunc adds a function.
 // Set timeout as Unlimited(=0) to disable executing timeout.
-func (worker *Worker) AddFunc(funcname string,
-	f JobFunc, timeout uint32) (err error) {
+func (worker *Worker) AddFunc(funcname string, f JobFunc, timeout uint32) (err error) {
 	worker.Lock()
 	defer worker.Unlock()
 	if _, ok := worker.funcs[funcname]; ok {

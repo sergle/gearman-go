@@ -29,10 +29,10 @@ import (
 // The job supply is driven by GRAB, not pushed: Work() grabs once per agent at
 // startup and handleInPack grabs again for every JOB_ASSIGN it dispatches
 // (worker.go:157), so answering each grab with one assignment keeps the
-// pipeline saturated with at most one server->worker packet outstanding. That
-// matters: agent.read (agent.go:181-184) takes the body length from the *first*
-// read's header, so a burst of pushed packets can arrive coalesced and be
-// mis-framed. One connection per test keeps that out of the measurement.
+// pipeline saturated with at most one server->worker packet outstanding, which
+// keeps the benchmarks measuring the pipeline rather than the queueing.
+// Coalescing and splitting are agent.read's problem and it handles both;
+// SetChunkWrites forces a split for the tests that want one.
 //
 // PRE_SLEEP is answered with silence, as gearmand does: a worker that is told
 // NO_JOB sleeps until a NOOP wakes it. Replying to PRE_SLEEP immediately would
@@ -43,6 +43,7 @@ import (
 type fakeWorkerServer struct {
 	ln net.Listener
 
+	wmu       sync.Mutex // see send: chunked packets must not interleave
 	mu        sync.Mutex
 	conns     []net.Conn
 	abilities []string         // funcnames from CAN_DO / CAN_DO_TIMEOUT
@@ -57,6 +58,39 @@ type fakeWorkerServer struct {
 	done      chan struct{}    // closed when completed == target
 	payload   []byte           // body of each JOB_ASSIGN_UNIQ
 	fn        string           // funcname of each JOB_ASSIGN_UNIQ
+	chunks    []int            // leading write sizes per response; see SetChunkWrites
+}
+
+// send exists so a test can force a packet to arrive in pieces. Over loopback
+// one Write usually lands as one read, so a split has to be made rather than
+// hoped for -- and it has to be paced, because back-to-back writes are
+// recoalesced by TCP and by the worker's bufio.Reader. A test that only looked
+// split would pass against framing that cannot handle a short read.
+//
+// wmu is required once packets take several writes: serve() answering a GRAB
+// and Serve() sending its wake-up NOOP write to the same connection, and
+// interleaved chunks desync the worker for reasons unrelated to the code under
+// test.
+func (s *fakeWorkerServer) send(conn net.Conn, pkt []byte) {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+
+	s.mu.Lock()
+	sizes := append([]int(nil), s.chunks...)
+	s.mu.Unlock()
+
+	off := 0
+	for _, n := range sizes {
+		if n <= 0 || off+n >= len(pkt) {
+			break
+		}
+		if _, err := conn.Write(pkt[off : off+n]); err != nil {
+			return
+		}
+		off += n
+		time.Sleep(time.Millisecond)
+	}
+	conn.Write(pkt[off:])
 }
 
 // fakeWorkResult is one WORK_COMPLETE-family packet received from the worker.
@@ -156,9 +190,9 @@ func (s *fakeWorkerServer) handle(conn net.Conn, dataType uint32, body []byte) {
 
 	case dtGrabJob, dtGrabJobUniq:
 		if assign, ok := s.takeJob(); ok {
-			conn.Write(assign)
+			s.send(conn, assign)
 		} else {
-			conn.Write(resPacket(dtNoJob, nil))
+			s.send(conn, resPacket(dtNoJob, nil))
 		}
 
 	case dtPreSleep:
@@ -170,7 +204,7 @@ func (s *fakeWorkerServer) handle(conn net.Conn, dataType uint32, body []byte) {
 			s.echoes = append(s.echoes, body)
 		}
 		s.mu.Unlock()
-		conn.Write(resPacket(dtEchoRes, body))
+		s.send(conn, resPacket(dtEchoRes, body))
 
 	case dtWorkComplete, dtWorkFail, dtWorkException:
 		s.completeJob(dataType, body)
@@ -281,7 +315,7 @@ func (s *fakeWorkerServer) Serve(n int) <-chan struct{} {
 
 	noop := resPacket(dtNoop, nil)
 	for _, c := range conns {
-		c.Write(noop)
+		s.send(c, noop)
 	}
 	return done
 }
@@ -292,6 +326,19 @@ func (s *fakeWorkerServer) SetJob(fn string, payload []byte) {
 	defer s.mu.Unlock()
 	s.fn = fn
 	s.payload = payload
+}
+
+// SetChunkWrites takes leading write sizes rather than one chunk size because
+// the sizes are the whole point. (8, 10) is the pattern that desynced the old
+// framing: a first write shorter than a header, then one crossing 12 bytes, so
+// read returns a partial packet and the next starts mid-body, taking its length
+// from payload bytes. A uniform sub-header split does *not* reproduce it --
+// every read then comes back short and the old leftdata buffer reassembled
+// those correctly, which cost one wrong test before it was noticed.
+func (s *fakeWorkerServer) SetChunkWrites(sizes ...int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.chunks = append([]int(nil), sizes...)
 }
 
 // SetRecord turns recording of abilities, echoes and work results on or off. It

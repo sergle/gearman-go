@@ -4,10 +4,12 @@ const (
 	Network = "tcp"
 	// queue size
 	queueSize = 8
-	// read buffer size
-	bufferSize = 1024
 	// min packet length
 	minPacketLength = 12
+	// Not a protocol limit -- Gearman's length field is a full uint32. A bound
+	// so that a desynced stream fails fast instead of allocating whatever four
+	// payload bytes happened to say. Raise it if jobs ever get this big.
+	maxPacketLength = 64 << 20
 
 	// \x00REQ
 	req    = 5391697
