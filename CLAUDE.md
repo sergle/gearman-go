@@ -29,7 +29,7 @@ Use the Makefile; `make help` lists everything.
 ```sh
 make check                           # build + vet + fmt-check + test + examples
 make test                            # default suite, no gearmand
-make knownbugs                       # known unfixed defects — expected to FAIL
+make knownbugs                       # tests describing unfixed defects, if any exist
 make reproducers                     # the three race reproducers — expected to FAIL
 make bench                           # benchmarks vs the fake servers, no gearmand
 go test -run TestClientDo ./client    # single test
@@ -40,7 +40,10 @@ go test -run TestClientDo ./client    # single test
 the code does not have yet, so a red run is the expected state and making one
 green by weakening its test defeats the point. Which cases fail changes as
 fixes land, so read the per-test output rather than the exit code. Each test
-carries the defect it describes in its own comment.
+carries the defect it describes in its own comment. `make knownbugs` passing
+means only that no failing test is currently written for a known defect, not
+that none are open: `docs/todo.md` is the defect list, and this file does not
+track it.
 
 `make bench` is the same bargain in benchmark form: a case whose defect makes
 it wedge fails its watchdog instead of reporting a number. Every case reports a
@@ -148,11 +151,13 @@ test and the gate comes off. `client/liveness_test.go` is where the
 hangs rather than fails. `worker/framing_test.go` is the worker's equivalent —
 the `agent.read` framing tests — with its own `readWithin` for the same reason.
 
-`worker/knownbugs_test.go` is therefore **empty of tests** right now, and stays
-on disk deliberately: `make knownbugs` passes `-knownbugs` to `./client` and
-`./worker` both, so `worker/worker_test.go` must keep defining the flag or that
-run dies with "flag provided but not defined", and `requireWorkerKnownBugs` is
-the hook the next worker-side defect uses.
+Either known-bug file can end up **empty of tests** as fixes land, and both stay
+on disk when they do: `make knownbugs` passes `-knownbugs` to `./client` and
+`./worker` both, so each package's `TestMain` must keep defining the flag or
+that run dies with "flag provided but not defined". `requireKnownBugs` and
+`requireWorkerKnownBugs` are the hooks the next defect on either side uses, and
+the client's file also holds `mustReturnWithin`, which the regression tests it
+graduated still call — so an empty file is not dead code.
 
 `worker/worker_racy_test.go` is the exception: it is not gated, but passes
 vacuously without a server because `AddServer` does not dial and `Ready`'s

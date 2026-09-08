@@ -60,28 +60,14 @@ func mustReturnWithin(t *testing.T, d time.Duration, what string, fn func() erro
 // runs in the default suite rather than behind -knownbugs — which is where a
 // fixed defect's regression test belongs.
 //
-// Pool.selectServer spins forever on an empty pool: SelectWithRate returns
-// pool.last ("") with nothing to choose from, the map lookup misses, and
-// `for client == nil` goes round again. ErrNotFound already exists for this.
-// SelectRandom has the same precondition and panics instead, via rand.Intn(0).
+// Pool.selectServer spinning forever on an empty pool (and SelectRandom
+// panicking on the same precondition) was fixed on 2026-09-07:
+// TestPoolOnEmptyPoolReturnsNotFound moved to pool_selection_test.go, ungated,
+// with the rest of the selection regression tests beside it.
 //
-// Reached in practice by `make integration` with no gearmand: every Pool.Add
-// fails, so the pool is empty by the time a Pool.Echo runs.
-//
-// NOTE: unlike the other tests here, the goroutine this leaks is *runnable*,
-// not blocked — it burns a core for the rest of the test binary's life. That is
-// the defect, and the reason this test is gated rather than run by default.
-//
-// Fix: return ErrNotFound instead of looping.
-func TestPoolOnEmptyPoolReturnsNotFound(t *testing.T) {
-	requireKnownBugs(t)
-
-	p := NewPool()
-	err := mustReturnWithin(t, 2*time.Second, "Pool.Echo on an empty pool", func() error {
-		_, err := p.Echo("", []byte("ping"))
-		return err
-	})
-	if err != ErrNotFound {
-		t.Errorf("Pool.Echo on an empty pool = %v, want ErrNotFound", err)
-	}
-}
+// This file therefore has no tests left in it, and stays on disk deliberately.
+// `make knownbugs` passes -knownbugs to ./client as well as ./worker, so
+// client_test.go must keep defining the flag or that run dies with "flag
+// provided but not defined"; requireKnownBugs is the hook the next client-side
+// defect uses, and mustReturnWithin is still called from liveness_test.go and
+// pool_selection_test.go, which live in this package for exactly that reason.
