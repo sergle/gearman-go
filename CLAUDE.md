@@ -132,6 +132,22 @@ The gates are package-level bools set in `TestMain`: `runIntegrationTests` and
 `worker/worker_test.go`. New tests must check the relevant one explicitly, or
 they will run in CI with no job server.
 
+### More than one job server
+
+`make integration` brings up `GEARMAND_COUNT` job servers (default 3) on
+`GEARMAND_PORT`, +1, +2, reusing any port already answering and tearing down
+only what it started, and hands both test binaries the list in the
+**`GEARMAND_POOL_ADDRS`** env var. `client/pool_integration_test.go` pools them
+to check server selection against real gearmands; it skips when given fewer than
+two, so `GEARMAND_COUNT=1` is the old single-server run. `make gearmand` /
+`gearmand-stop` manage the same set.
+
+An env var rather than a third test flag, because a flag must be defined in the
+`TestMain` of **every** package it is passed to or the run dies with "flag
+provided but not defined". The rest — what the tests assert, why nothing is
+asserted about `Rate`, and the traps in the target — is in
+`docs/ai/pool_multiserver_integration.md`.
+
 A `TestMain` that defines such a flag must call `flag.Parse()` *before*
 dereferencing it. Without that the gate reads the zero value, every gated test
 in the package skips even when the flag is given, and the run looks green while

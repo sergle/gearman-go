@@ -25,12 +25,21 @@ BENCH_TIMEOUT ?= 600s
 
 GEARMAND_HOST  ?= 127.0.0.1
 GEARMAND_PORT  ?= 4730
+# Job servers to bring up, on GEARMAND_PORT, +1, +2 ... The first is what every
+# single-server test connects to; the rest feed the multi-server Pool tests in
+# client/pool_integration_test.go via GEARMAND_POOL_ADDRS. 1 is the old behaviour.
+GEARMAND_COUNT ?= 3
 # Pinned, not :latest, so a run is reproducible. 2.1.0, 2.1.0-alpine and latest
 # are currently the same image id — the upstream image is already Alpine-based.
 GEARMAND_IMAGE ?= artefactual/gearmand:2.1.0-alpine
 GEARMAND_NAME  ?= gearman-go-it
 
-port_open = bash -c 'exec 3<>/dev/tcp/$(GEARMAND_HOST)/$(GEARMAND_PORT)' 2>/dev/null
+# port_open takes the port as $1. Double quotes are required -- single ones
+# leave the inner shell a literal $1, so every check fails. `bash -c` is
+# explicit because make's default /bin/sh has no /dev/tcp.
+define port_open_fn
+port_open() { bash -c "exec 3<>/dev/tcp/$(GEARMAND_HOST)/$$1" 2>/dev/null; }
+endef
 
 # Pre-existing `go vet` findings, present before any of this work. The vet
 # target ignores exactly these and fails on anything new. Matched by file and
@@ -117,44 +126,83 @@ knownbugs: ## Tests for known unfixed defects (expected FAIL)
 
 # --- occasional ------------------------------------------------------------
 
-integration: ## Run the integration suite, starting gearmand in docker if needed
+# A port already answering is reused; only containers this run started are torn
+# down. An extra server that cannot be started is a warning -- the pool tests
+# skip on fewer than two. The FIRST is fatal: every other test hardcodes it.
+#
+# `docker run` is tested, not left bare, and cleanup is a trap: under `set -e` a
+# bare failure at i=2 would abort before i=1's container was recorded, leaving it
+# on 4730 for the next run to silently "reuse". The trap also covers Ctrl-C.
+integration: ## Run the integration suite, starting GEARMAND_COUNT gearmands in docker if needed
 	@set -e; \
-	started=0; \
-	if $(port_open); then \
-	  echo "==> using the gearmand already on $(GEARMAND_HOST):$(GEARMAND_PORT)"; \
-	else \
-	  command -v docker >/dev/null 2>&1 || { \
-	    echo "make: nothing on $(GEARMAND_HOST):$(GEARMAND_PORT) and no docker to start one."; \
-	    echo "      Start a job server yourself, or set GEARMAND_HOST/GEARMAND_PORT."; \
-	    exit 1; }; \
-	  echo "==> starting $(GEARMAND_IMAGE) as $(GEARMAND_NAME)"; \
-	  docker rm -f $(GEARMAND_NAME) >/dev/null 2>&1 || true; \
-	  docker run --rm -d --name $(GEARMAND_NAME) \
-	    -p $(GEARMAND_PORT):4730 $(GEARMAND_IMAGE) >/dev/null; \
-	  started=1; \
-	  for i in $$(seq 60); do $(port_open) && break; sleep 0.25; done; \
-	  $(port_open) || { \
-	    echo "make: $(GEARMAND_NAME) never accepted connections; logs follow"; \
-	    docker logs $(GEARMAND_NAME) 2>&1 | tail -20; \
-	    docker rm -f $(GEARMAND_NAME) >/dev/null 2>&1 || true; \
-	    exit 1; }; \
-	fi; \
+	$(port_open_fn); \
+	started=""; addrs=""; \
+	cleanup() { \
+	  for n in $$started; do \
+	    echo "==> stopping $$n"; \
+	    docker rm -f $$n >/dev/null 2>&1 || true; \
+	  done; \
+	  started=""; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	for i in $$(seq $(GEARMAND_COUNT)); do \
+	  port=$$(($(GEARMAND_PORT) + i - 1)); name=$(GEARMAND_NAME)-$$i; ok=0; \
+	  if port_open $$port; then \
+	    echo "==> using the job server already on $(GEARMAND_HOST):$$port"; ok=1; \
+	  elif command -v docker >/dev/null 2>&1; then \
+	    echo "==> starting $(GEARMAND_IMAGE) as $$name on $(GEARMAND_HOST):$$port"; \
+	    docker rm -f $$name >/dev/null 2>&1 || true; \
+	    if docker run --rm -d --name $$name --hostname $$name \
+	         -p $$port:4730 $(GEARMAND_IMAGE) >/dev/null; then \
+	      started="$$started $$name"; \
+	      for n in $$(seq 60); do port_open $$port && break; sleep 0.25; done; \
+	      if port_open $$port; then ok=1; else \
+	        echo "make: $$name never accepted connections; logs follow"; \
+	        docker logs $$name 2>&1 | tail -20; \
+	      fi; \
+	    else \
+	      echo "make: could not start $$name"; \
+	      docker rm -f $$name >/dev/null 2>&1 || true; \
+	    fi; \
+	  fi; \
+	  if [ $$ok -eq 1 ]; then \
+	    addrs="$${addrs:+$$addrs,}$(GEARMAND_HOST):$$port"; \
+	  elif [ $$i -eq 1 ]; then \
+	    echo "make: no job server on $(GEARMAND_HOST):$$port and none could be started."; \
+	    echo "      Start one yourself, or set GEARMAND_HOST/GEARMAND_PORT."; \
+	    exit 1; \
+	  else \
+	    echo "make: no job server on $(GEARMAND_HOST):$$port; the multi-server Pool tests will skip"; \
+	  fi; \
+	done; \
+	echo "==> job servers: $$addrs"; \
 	rc=0; \
-	$(GO) test -count=1 -timeout $(TIMEOUT) ./client ./worker -integration || rc=$$?; \
-	if [ $$started -eq 1 ]; then \
-	  echo "==> stopping $(GEARMAND_NAME)"; \
-	  docker rm -f $(GEARMAND_NAME) >/dev/null 2>&1 || true; \
-	fi; \
+	GEARMAND_POOL_ADDRS="$$addrs" \
+	  $(GO) test -count=1 -timeout $(TIMEOUT) ./client ./worker -integration || rc=$$?; \
 	exit $$rc
 
-gearmand: ## Start a background gearmand for manual use
-	@docker rm -f $(GEARMAND_NAME) >/dev/null 2>&1 || true
-	docker run --rm -d --name $(GEARMAND_NAME) -p $(GEARMAND_PORT):4730 $(GEARMAND_IMAGE)
-	@for i in $$(seq 60); do $(port_open) && break; sleep 0.25; done
-	@$(port_open) && echo "gearmand ready on $(GEARMAND_HOST):$(GEARMAND_PORT)"
+gearmand: ## Start GEARMAND_COUNT background gearmands for manual use
+	@set -e; \
+	$(port_open_fn); \
+	for i in $$(seq $(GEARMAND_COUNT)); do \
+	  port=$$(($(GEARMAND_PORT) + i - 1)); name=$(GEARMAND_NAME)-$$i; \
+	  docker rm -f $$name >/dev/null 2>&1 || true; \
+	  docker run --rm -d --name $$name --hostname $$name \
+	    -p $$port:4730 $(GEARMAND_IMAGE) >/dev/null; \
+	  for n in $$(seq 60); do port_open $$port && break; sleep 0.25; done; \
+	  port_open $$port \
+	    && echo "$$name ready on $(GEARMAND_HOST):$$port" \
+	    || { echo "make: $$name never accepted connections"; exit 1; }; \
+	done
 
-gearmand-stop: ## Stop the gearmand started by `make gearmand`
-	@docker rm -f $(GEARMAND_NAME) >/dev/null 2>&1 && echo "stopped" || echo "not running"
+# The unsuffixed name too: containers left by the single-server version.
+gearmand-stop: ## Stop the gearmands started by `make gearmand`
+	@stopped=""; \
+	for name in $(GEARMAND_NAME) $$(for i in $$(seq $(GEARMAND_COUNT)); do echo $(GEARMAND_NAME)-$$i; done); do \
+	  [ -n "$$(docker ps -aq -f name=^$$name$$ 2>/dev/null)" ] || continue; \
+	  docker rm -f $$name >/dev/null 2>&1 && stopped="$$stopped $$name" || true; \
+	done; \
+	if [ -n "$$stopped" ]; then echo "stopped:$$stopped"; else echo "not running"; fi
 
 tidy: ## Tidy both modules
 	$(GO) mod tidy
