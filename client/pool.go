@@ -63,7 +63,10 @@ type Pool struct {
 
 	last string
 
-	mutex sync.Mutex
+	// mutex guards Clients, last and every PoolClient.Rate. Never held across
+	// a call into a Client: that would stall every other caller for a whole
+	// round trip.
+	mutex sync.RWMutex
 }
 
 // NewPool returns a new pool.
@@ -75,21 +78,36 @@ func NewPool() (pool *Pool) {
 }
 
 // Add a server with rate.
+//
+// The dial happens outside pool.mutex. Now that the readers take the lock, one
+// unreachable job server would otherwise block every submit in the process for
+// a full dial timeout -- during a reload or a failover, which is the case the
+// locking exists for in the first place.
+//
+// The cost is that two concurrent Adds for one address both dial, so the
+// second acquisition re-checks and closes the loser rather than leaking it.
 func (pool *Pool) Add(net, addr string, rate int) (err error) {
 	pool.mutex.Lock()
-	defer pool.mutex.Unlock()
-	var item *PoolClient
-	var ok bool
-	if item, ok = pool.Clients[addr]; ok {
+	if item, ok := pool.Clients[addr]; ok {
 		item.Rate = rate
-	} else {
-		var client *Client
-		client, err = New(net, addr)
-		if err == nil {
-			item = &PoolClient{Client: client, Rate: rate}
-			pool.Clients[addr] = item
-		}
+		pool.mutex.Unlock()
+		return
 	}
+	pool.mutex.Unlock()
+
+	var client *Client
+	if client, err = New(net, addr); err != nil {
+		return
+	}
+
+	pool.mutex.Lock()
+	defer pool.mutex.Unlock()
+	if item, ok := pool.Clients[addr]; ok {
+		item.Rate = rate
+		client.Close()
+		return
+	}
+	pool.Clients[addr] = &PoolClient{Client: client, Rate: rate}
 	return
 }
 
@@ -130,11 +148,14 @@ func (pool *Pool) DoBg(funcname string, data []byte, flag byte) (addr, handle st
 // until the job server answers.
 // !!!Not fully tested.!!!
 func (pool *Pool) Status(addr, handle string) (status *Status, err error) {
-	if client, ok := pool.Clients[addr]; ok {
-		status, err = client.Status(handle)
-	} else {
+	pool.mutex.RLock()
+	client, ok := pool.Clients[addr]
+	pool.mutex.RUnlock()
+	if !ok {
 		err = ErrNotFound
+		return
 	}
+	status, err = client.Status(handle)
 	return
 }
 
@@ -147,8 +168,11 @@ func (pool *Pool) Echo(addr string, data []byte) (echo []byte, err error) {
 			return
 		}
 	} else {
+		pool.mutex.RLock()
 		var ok bool
-		if client, ok = pool.Clients[addr]; !ok {
+		client, ok = pool.Clients[addr]
+		pool.mutex.RUnlock()
+		if !ok {
 			err = ErrNotFound
 			return
 		}
@@ -157,10 +181,18 @@ func (pool *Pool) Echo(addr string, data []byte) (echo []byte, err error) {
 	return
 }
 
-// Close
+// Close closes every client in the pool. It snapshots the map first because
+// Client.Close does I/O, and the lock must not be held across that.
 func (pool *Pool) Close() (err map[string]error) {
-	err = make(map[string]error)
+	pool.mutex.RLock()
+	clients := make([]*PoolClient, 0, len(pool.Clients))
 	for _, c := range pool.Clients {
+		clients = append(clients, c)
+	}
+	pool.mutex.RUnlock()
+
+	err = make(map[string]error)
+	for _, c := range clients {
 		err[c.addr] = c.Close()
 	}
 	return
@@ -185,11 +217,16 @@ func (pool *Pool) Close() (err map[string]error) {
 // map at all. That is the precondition SelectRandom panicked on, and a custom
 // handler written the same way would panic the same way.
 //
-// Deliberately takes no lock: reading pool.Clients and writing pool.last
-// unsynchronised is defect 6b, and pool.mutex is the wrong lock for it -- Add
-// holds it across a full dial, so taking it here would stall every submit
-// behind an unreachable server. It wants the RWMutex pass, not this fix.
+// It takes the write lock, not RLock, because it writes pool.last -- and holds
+// it across the SelectionHandler call, because the handler reads
+// PoolClient.Rate, which Add writes. Snapshotting the map and calling the
+// handler outside the lock would not help: the copy holds the same pointers.
+//
+// So a SelectionHandler that calls back into the Pool deadlocks. Handlers are
+// expected to be pure functions of their arguments.
 func (pool *Pool) selectServer() (client *PoolClient, err error) {
+	pool.mutex.Lock()
+	defer pool.mutex.Unlock()
 	if len(pool.Clients) == 0 {
 		err = ErrNotFound
 		return
