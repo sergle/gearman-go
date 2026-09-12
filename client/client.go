@@ -4,6 +4,9 @@ package client
 
 import (
 	"bufio"
+	"encoding/binary"
+	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -39,9 +42,9 @@ const (
 type Client struct {
 	sync.Mutex
 
-	net, addr    string
-	innerHandler *responseHandlerMap
-	in           chan *Response
+	net, addr string
+	handlers  responseHandlers
+	in        chan *Response
 
 	// connMu guards the conn/rw pointers below, and nothing else.
 	//
@@ -109,42 +112,76 @@ func (client *Client) setConn(conn net.Conn, rw *bufio.ReadWriter) {
 	client.rw = rw
 }
 
-type responseHandlerMap struct {
-	sync.Mutex
-	holder map[string]handledResponse
-}
-
 type handledResponse struct {
-	internal ResponseHandler // internal handler, always non-nil
+	internal ResponseHandler // nil in a slot that holds nothing
 	external ResponseHandler // handler passed in from (*Client).Do, sometimes nil
 }
 
-func newResponseHandlerMap() *responseHandlerMap {
-	return &responseHandlerMap{holder: make(map[string]handledResponse, queueSize)}
+// responseHandlers holds the handlers waiting for a reply. JOB_CREATED and
+// ECHO_RES carry no correlation id, so each gets one slot; STATUS_RES carries
+// the job handle, so those are keyed by it.
+//
+// Zero value ready. Each member locks itself: no operation spans two, so there
+// is no order to get wrong.
+type responseHandlers struct {
+	created handlerSlot
+	echo    handlerSlot
+	status  statusHandlers
 }
 
-func (r *responseHandlerMap) remove(key string) {
-	r.Lock()
-	delete(r.holder, key)
-	r.Unlock()
+// handlerSlot holds at most one handler, which is all do and Echo can have
+// outstanding: both hold client.Mutex across the whole round trip.
+type handlerSlot struct {
+	mu sync.Mutex
+	h  handledResponse
 }
 
-func (r *responseHandlerMap) getAndRemove(key string) (handledResponse, bool) {
-	r.Lock()
-	rh, b := r.holder[key]
-	delete(r.holder, key)
-	r.Unlock()
-	return rh, b
+func (s *handlerSlot) set(internal, external ResponseHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.h = handledResponse{internal: internal, external: external}
 }
 
-func (r *responseHandlerMap) putWithExternalHandler(key string, internal, external ResponseHandler) {
-	r.Lock()
-	r.holder[key] = handledResponse{internal: internal, external: external}
-	r.Unlock()
+// take empties the slot and returns what was in it.
+func (s *handlerSlot) take() (h handledResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, s.h = s.h, handledResponse{}
+	return
 }
 
-func (r *responseHandlerMap) put(key string, rh ResponseHandler) {
-	r.putWithExternalHandler(key, rh, nil)
+func (s *handlerSlot) cancel() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.h = handledResponse{}
+}
+
+type statusHandlers struct {
+	mu sync.Mutex
+	m  map[string]handledResponse
+}
+
+func (s *statusHandlers) set(handle string, internal ResponseHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m == nil {
+		s.m = make(map[string]handledResponse, queueSize)
+	}
+	s.m[handle] = handledResponse{internal: internal}
+}
+
+func (s *statusHandlers) take(handle string) (h handledResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h = s.m[handle]
+	delete(s.m, handle)
+	return
+}
+
+func (s *statusHandlers) cancel(handle string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.m, handle)
 }
 
 // New returns a client.
@@ -152,7 +189,6 @@ func New(network, addr string) (client *Client, err error) {
 	client = &Client{
 		net:             network,
 		addr:            addr,
-		innerHandler:    newResponseHandlerMap(),
 		in:              make(chan *Response, queueSize),
 		wantExceptions:  DefaultExceptions,
 		ResponseTimeout: DefaultTimeout,
@@ -182,7 +218,7 @@ func (client *Client) connect() (err error) {
 	}
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	if client.wantExceptions {
-		if err = writeTo(rw, getOptionReq(optionExceptions)); err != nil {
+		if err = writeTo(rw, encodeRequestString(dtOptionReq, optionExceptions)); err != nil {
 			conn.Close()
 			return
 		}
@@ -201,26 +237,25 @@ func (client *Client) connect() (err error) {
 	return
 }
 
-// write encodes and sends one request on the current connection.
+// write sends one encoded packet on the current connection.
 //
 // Invariant: every caller holds client.Mutex -- do(), Status(), Echo(). They
 // share one bufio.Writer, so an unlocked write interleaves its bytes with a
 // concurrent request and destroys the framing. connect() is the one exception:
 // its rw is not published by setConn yet, so nothing else can reach it.
-func (client *Client) write(req *request) (err error) {
+func (client *Client) write(buf []byte) (err error) {
 	rw := client.getRW()
 	if rw == nil {
 		return ErrLostConn
 	}
-	return writeTo(rw, req)
+	return writeTo(rw, buf)
 }
 
-// writeTo encodes and flushes a request onto rw. It takes the reader/writer as
+// writeTo writes and flushes one packet onto rw. It takes the reader/writer as
 // an argument so connect() can use it on a connection that is not published
 // yet.
-func writeTo(rw *bufio.ReadWriter, req *request) (err error) {
+func writeTo(rw *bufio.ReadWriter, buf []byte) (err error) {
 	var n int
-	buf := req.Encode()
 	for i := 0; i < len(buf); i += n {
 		n, err = rw.Write(buf[i:])
 		if err != nil {
@@ -230,87 +265,86 @@ func writeTo(rw *bufio.ReadWriter, req *request) (err error) {
 	return rw.Flush()
 }
 
-func (client *Client) read(length int) (data []byte, err error) {
-	n := 0
+// readPacket reads one whole packet: the 12-byte header, then exactly the body
+// length it declares. It returns a fragment never, so readLoop carries no tail
+// between iterations. hdr is the caller's scratch.
+//
+// The magic check is the only cheap detector of a desynced stream, since
+// decodeResponse ignores data[0:4].
+func (client *Client) readPacket(hdr []byte) (packet []byte, err error) {
 	rw := client.getRW()
 	if rw == nil {
 		return nil, ErrLostConn
 	}
-	buf := getBuffer(bufferSize)
-	// read until data can be unpacked
-	for i := length; i > 0 || len(data) < minPacketLength; i -= n {
-		if n, err = rw.Read(buf); err != nil {
-			return
-		}
-		data = append(data, buf[0:n]...)
-		if n < bufferSize {
-			break
+	if _, err = io.ReadFull(rw, hdr); err != nil {
+		return nil, err
+	}
+	if magic := binary.BigEndian.Uint32(hdr[0:4]); magic != res {
+		return nil, fmt.Errorf("bad packet magic %q, want %q", hdr[0:4], resStr)
+	}
+	// While it is still unsigned: on a 32-bit build int(uint32) above 2^31 is
+	// negative and make panics with "len out of range".
+	bodyLen := binary.BigEndian.Uint32(hdr[8:12])
+	if bodyLen > maxPacketLength {
+		return nil, fmt.Errorf("packet body of %d bytes exceeds the %d-byte limit",
+			bodyLen, maxPacketLength)
+	}
+
+	// One slice, header and body: decodeResponse indexes both off it, and
+	// Response.Data aliases it. A packet per allocation is what keeps that
+	// aliasing safe.
+	packet = getBuffer(minPacketLength + int(bodyLen))
+	copy(packet, hdr)
+	if bodyLen > 0 {
+		if _, err = io.ReadFull(rw, packet[minPacketLength:]); err != nil {
+			return nil, err
 		}
 	}
-	return
+	return packet, nil
 }
 
 func (client *Client) readLoop() {
 	defer close(client.in)
-	var data, leftdata []byte
-	var err error
-	var resp *Response
-ReadLoop:
+	var hdr [minPacketLength]byte
 	for client.getConn() != nil {
-		if data, err = client.read(bufferSize); err != nil {
+		packet, err := client.readPacket(hdr[:])
+		if err != nil {
 			if opErr, ok := err.(*net.OpError); ok {
 				if opErr.Timeout() {
 					client.err(err)
 				}
-				if opErr.Temporary() {
-					continue
+				if !opErr.Temporary() {
+					// Permanent, which includes the socket Close() just took:
+					// redialing would resurrect a client the caller shut down.
+					break
 				}
-				break
+			} else {
+				client.err(err)
 			}
-			client.err(err)
-			// If it is unexpected error and the connection wasn't
-			// closed by Gearmand, the client should close the conection
-			// and reconnect to job server. connect() re-negotiates the
-			// "exceptions" option, which the server holds per connection.
+			// A half-read packet cannot be resynchronised, so rebuild the
+			// connection rather than resume mid-stream. connect() re-negotiates
+			// the "exceptions" option, which the server holds per connection.
 			//
-			// closeConn, not Close: callers hold client.Mutex for a whole
-			// round trip, so taking it here would stall the re-dial until
-			// their ResponseTimeout fired -- and their response can only
-			// arrive over the connection this loop is rebuilding.
+			// closeConn, not Close: callers hold client.Mutex for a whole round
+			// trip, so taking it here would stall the re-dial until their
+			// ResponseTimeout fired -- and their response can only arrive over
+			// the connection this loop is rebuilding.
 			client.closeConn()
 			if err = client.connect(); err != nil {
 				client.err(err)
 				break
 			}
-			// Whatever was left half-parsed belongs to the connection that
-			// just died. Keeping it would prepend stale bytes to the first
-			// packet of the new one -- which is now the answer to the
-			// OPTION_REQ.
-			leftdata = nil
 			continue
 		}
-		if len(leftdata) > 0 { // some data left for processing
-			data = append(leftdata, data...)
-			leftdata = nil
+		resp, _, err := decodeResponse(packet)
+		if err != nil {
+			// The packet was whole and its length checked, so this is a
+			// malformed body and the stream is still in sync. Report it and
+			// take the next packet.
+			client.err(err)
+			continue
 		}
-		for {
-			l := len(data)
-			if l < minPacketLength { // not enough data
-				leftdata = data
-				continue ReadLoop
-			}
-			if resp, l, err = decodeResponse(data); err != nil {
-				leftdata = data[l:]
-				continue ReadLoop
-			} else {
-				client.in <- resp
-			}
-			data = data[l:]
-			if len(data) > 0 {
-				continue
-			}
-			break
-		}
+		client.in <- resp
 	}
 }
 
@@ -354,11 +388,11 @@ func (client *Client) processLoop() {
 		case dtOptionRes:
 			// A late or repeated acknowledgement. The state is already set.
 		case dtStatusRes:
-			client.handleInner("s"+resp.Handle, resp, nil)
+			client.deliver(client.handlers.status.take(resp.Handle), resp, nil)
 		case dtJobCreated:
-			client.handleInner("c", resp, rhandlers)
+			client.deliver(client.handlers.created.take(), resp, rhandlers)
 		case dtEchoRes:
-			client.handleInner("e", resp, nil)
+			client.deliver(client.handlers.echo.take(), resp, nil)
 		case dtWorkData, dtWorkWarning, dtWorkStatus:
 			if cb := rhandlers[resp.Handle]; cb != nil {
 				cb(resp)
@@ -378,13 +412,16 @@ func (client *Client) err(e error) {
 	}
 }
 
-func (client *Client) handleInner(key string, resp *Response, rhandlers map[string]ResponseHandler) {
-	if h, ok := client.innerHandler.getAndRemove(key); ok {
-		if h.external != nil && resp.Handle != "" {
-			rhandlers[resp.Handle] = h.external
-		}
-		h.internal(resp)
+// deliver runs a handler taken out of its slot. Called outside the slot lock:
+// the handler is the caller's code and must not run under it.
+func (client *Client) deliver(h handledResponse, resp *Response, rhandlers map[string]ResponseHandler) {
+	if h.internal == nil {
+		return
 	}
+	if h.external != nil && resp.Handle != "" {
+		rhandlers[resp.Handle] = h.external
+	}
+	h.internal(resp)
 }
 
 type handleOrError struct {
@@ -392,8 +429,7 @@ type handleOrError struct {
 	err    error
 }
 
-func (client *Client) do(funcname string, data []byte,
-	flag uint32, h ResponseHandler, id string) (handle string, err error) {
+func (client *Client) do(funcname string, data []byte, flag uint32, h ResponseHandler, id string) (handle string, err error) {
 	if len(id) == 0 {
 		return "", ErrInvalidId
 	}
@@ -403,27 +439,29 @@ func (client *Client) do(funcname string, data []byte,
 	var result = make(chan handleOrError, 1)
 	client.Lock()
 	defer client.Unlock()
-	client.innerHandler.putWithExternalHandler("c", func(resp *Response) {
+	// Locals, not the named returns: this runs on processLoop's goroutine, and
+	// a response arriving after the timeout would be writing them while do has
+	// already returned.
+	client.handlers.created.set(func(resp *Response) {
 		if resp.DataType == dtError {
-			err = getError(resp.Data)
-			result <- handleOrError{"", err}
+			result <- handleOrError{"", getError(resp.Data)}
 			return
 		}
-		handle = resp.Handle
-		result <- handleOrError{handle, nil}
+		result <- handleOrError{resp.Handle, nil}
 	}, h)
-	req := getJob(id, []byte(funcname), data)
-	req.DataType = flag
-	if err = client.write(req); err != nil {
-		client.innerHandler.remove("c")
+	if err = client.write(encodeJob(flag, funcname, id, data)); err != nil {
+		client.handlers.created.cancel()
 		return
 	}
-	var timer = time.After(client.ResponseTimeout)
+	// NewTimer with a Stop, not time.After: an unstopped timer stays live for
+	// the whole ResponseTimeout after an early return.
+	timer := time.NewTimer(client.ResponseTimeout)
+	defer timer.Stop()
 	select {
 	case ret := <-result:
 		return ret.handle, ret.err
-	case <-timer:
-		client.innerHandler.remove("c")
+	case <-timer.C:
+		client.handlers.created.cancel()
 		return "", ErrLostConn
 	}
 	return
@@ -431,16 +469,14 @@ func (client *Client) do(funcname string, data []byte,
 
 // Call the function and get a response.
 // flag can be set to: JobLow, JobNormal and JobHigh
-func (client *Client) Do(funcname string, data []byte,
-	flag byte, h ResponseHandler) (handle string, err error) {
+func (client *Client) Do(funcname string, data []byte, flag byte, h ResponseHandler) (handle string, err error) {
 	handle, err = client.DoWithId(funcname, data, flag, h, IdGen.Id())
 	return
 }
 
 // Call the function in background, no response needed.
 // flag can be set to: JobLow, JobNormal and JobHigh
-func (client *Client) DoBg(funcname string, data []byte,
-	flag byte) (handle string, err error) {
+func (client *Client) DoBg(funcname string, data []byte, flag byte) (handle string, err error) {
 	handle, err = client.DoBgWithId(funcname, data, flag, IdGen.Id())
 	return
 }
@@ -465,24 +501,17 @@ func (client *Client) Status(handle string) (status *Status, err error) {
 	// Buffered: a response arriving after the timeout is dropped rather than
 	// parking processLoop on a send nobody will receive.
 	var result = make(chan statusOrError, 1)
-	key := "s" + handle
 	client.Lock()
 	defer client.Unlock()
-	client.innerHandler.put(key, func(resp *Response) {
+	client.handlers.status.set(handle, func(resp *Response) {
 		st, serr := resp._status()
 		result <- statusOrError{st, serr}
 	})
-	req := getRequest()
-	req.DataType = dtGetStatus
-	req.Data = []byte(handle)
-	if err = client.write(req); err != nil {
-		client.innerHandler.remove(key)
+	if err = client.write(encodeRequestString(dtGetStatus, handle)); err != nil {
+		client.handlers.status.cancel(handle)
 		return nil, err
 	}
-	// NewTimer with a Stop, not time.After: a round trip is microseconds
-	// against a default of a second, and an unstopped time.After timer stays
-	// live for all of it. do() predates this and still uses time.After.
-	timer := time.NewTimer(client.ResponseTimeout)
+	timer := time.NewTimer(client.ResponseTimeout) // stopped, see do
 	defer timer.Stop()
 	select {
 	case ret := <-result:
@@ -490,7 +519,7 @@ func (client *Client) Status(handle string) (status *Status, err error) {
 		// asked, and reporting both ways fires the handler needlessly.
 		return ret.status, ret.err
 	case <-timer.C:
-		client.innerHandler.remove(key)
+		client.handlers.status.cancel(handle)
 		return nil, ErrLostConn
 	}
 }
@@ -505,23 +534,20 @@ func (client *Client) Echo(data []byte) (echo []byte, err error) {
 	var result = make(chan []byte, 1) // buffered, see Status
 	client.Lock()
 	defer client.Unlock()
-	client.innerHandler.put("e", func(resp *Response) {
+	client.handlers.echo.set(func(resp *Response) {
 		result <- resp.Data
-	})
-	req := getRequest()
-	req.DataType = dtEchoReq
-	req.Data = data
-	if err = client.write(req); err != nil {
-		client.innerHandler.remove("e")
+	}, nil)
+	if err = client.write(encodeRequest(dtEchoReq, data)); err != nil {
+		client.handlers.echo.cancel()
 		return nil, err
 	}
-	timer := time.NewTimer(client.ResponseTimeout) // stopped, see Status
+	timer := time.NewTimer(client.ResponseTimeout) // stopped, see do
 	defer timer.Stop()
 	select {
 	case ret := <-result:
 		return ret, nil
 	case <-timer.C:
-		client.innerHandler.remove("e")
+		client.handlers.echo.cancel()
 		return nil, ErrLostConn
 	}
 }
@@ -552,8 +578,7 @@ func (client *Client) Close() (err error) {
 
 // Call the function and get a response.
 // flag can be set to: JobLow, JobNormal and JobHigh
-func (client *Client) DoWithId(funcname string, data []byte,
-	flag byte, h ResponseHandler, id string) (handle string, err error) {
+func (client *Client) DoWithId(funcname string, data []byte, flag byte, h ResponseHandler, id string) (handle string, err error) {
 	var datatype uint32
 	switch flag {
 	case JobLow:
@@ -569,8 +594,7 @@ func (client *Client) DoWithId(funcname string, data []byte,
 
 // Call the function in background, no response needed.
 // flag can be set to: JobLow, JobNormal and JobHigh
-func (client *Client) DoBgWithId(funcname string, data []byte,
-	flag byte, id string) (handle string, err error) {
+func (client *Client) DoBgWithId(funcname string, data []byte, flag byte, id string) (handle string, err error) {
 	if client.getConn() == nil {
 		return "", ErrLostConn
 	}

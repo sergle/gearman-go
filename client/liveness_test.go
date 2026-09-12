@@ -1,7 +1,10 @@
 package client
 
 import (
+	"encoding/binary"
 	"fmt"
+	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -190,4 +193,76 @@ func TestCloseDuringInFlightEcho(t *testing.T) {
 	case <-time.After(4 * time.Second):
 		t.Fatal("Echo did not return")
 	}
+}
+
+// do's response handler runs on processLoop's goroutine. It used to assign the
+// named returns `handle` and `err`, which a response arriving as the timeout
+// fires writes while do is already returning them.
+//
+// The window is between the slot's take returning a handler and deliver
+// calling it: cancelling on timeout empties the slot afterwards, not during. So
+// the server answers at exactly ResponseTimeout and the test runs enough rounds
+// to land inside it. No assertions -- the detector is the oracle, as in
+// race_test.go.
+func TestDoHandlerDoesNotWriteReturnsAfterTimeout(t *testing.T) {
+	const (
+		rounds  = 300
+		timeout = 2 * time.Millisecond
+	)
+
+	addr := lateJobCreatedServer(t, timeout)
+	c, err := New(Network, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.ErrorHandler = func(error) {}
+	c.ResponseTimeout = timeout
+
+	for i := 0; i < rounds; i++ {
+		// Either outcome is fine: the point is the handler running while do
+		// returns, not which side wins.
+		c.DoBgWithId("f", []byte("x"), JobNormal, fmt.Sprintf("id-%d", i))
+	}
+}
+
+// lateJobCreatedServer answers OPTION_REQ at once -- connect() sends it first
+// on every connection and blocks the handshake otherwise -- and every
+// SUBMIT_JOB after delay.
+func lateJobCreatedServer(t *testing.T, delay time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				hdr := make([]byte, minPacketLength)
+				for {
+					if _, err := io.ReadFull(conn, hdr); err != nil {
+						return
+					}
+					dt := binary.BigEndian.Uint32(hdr[4:8])
+					body := make([]byte, binary.BigEndian.Uint32(hdr[8:12]))
+					if _, err := io.ReadFull(conn, body); err != nil {
+						return
+					}
+					if dt == dtOptionReq {
+						writePacket(conn, dtOptionRes, body)
+						continue
+					}
+					time.Sleep(delay)
+					writePacket(conn, dtJobCreated, []byte("H:late:1"))
+				}
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
 }

@@ -222,12 +222,19 @@ func boolByte(b bool) string {
 
 // writePacket frames and sends one response packet.
 func writePacket(conn net.Conn, dataType uint32, data []byte) {
+	conn.Write(frameResponse(dataType, data))
+}
+
+// frameResponse builds one response packet as the job server puts it on the
+// wire. Split out so microbench_test.go's fixtures share this framing rather
+// than carrying a second copy.
+func frameResponse(dataType uint32, data []byte) []byte {
 	buf := make([]byte, minPacketLength+len(data))
 	copy(buf[:4], resStr)
 	binary.BigEndian.PutUint32(buf[4:8], dataType)
 	binary.BigEndian.PutUint32(buf[8:12], uint32(len(data)))
 	copy(buf[minPacketLength:], data)
-	conn.Write(buf)
+	return buf
 }
 
 // --- knobs -----------------------------------------------------------------

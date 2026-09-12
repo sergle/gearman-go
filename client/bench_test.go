@@ -86,8 +86,7 @@ func BenchmarkClientDo(b *testing.B) {
 }
 
 // BenchmarkClientDoBgLargePayload keeps the request path but makes the body
-// bigger than the client's 1KB read buffer, so readLoop's leftdata re-framing
-// runs on every iteration.
+// large enough that encoding and writing it dominate the round trip.
 func BenchmarkClientDoBgLargePayload(b *testing.B) {
 	s := newBenchServer(b)
 	c := newTestClient(b, s)

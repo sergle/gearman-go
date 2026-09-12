@@ -142,7 +142,7 @@ func TestOptionReqEncode(t *testing.T) {
 	// \x00REQ, type 26, length 10, then the bare option name -- no trailing
 	// NULL byte, per the protocol.
 	want := []byte("\x00REQ\x00\x00\x00\x1a\x00\x00\x00\x0aexceptions")
-	if got := getOptionReq(optionExceptions).Encode(); !bytes.Equal(got, want) {
+	if got := encodeRequestString(dtOptionReq, optionExceptions); !bytes.Equal(got, want) {
 		t.Errorf("OPTION_REQ encoded as %q, want %q", got, want)
 	}
 }
@@ -429,8 +429,8 @@ func TestWorkExceptionReachesHandler(t *testing.T) {
 // TestOptionReplayedAfterReconnect checks that the option is requested again
 // after a redial -- the job server keeps it per connection, so skipping the
 // replay would silently lose exceptions. The first connection is killed
-// mid-packet, which also exercises the leftdata reset: without it the stale
-// half packet would corrupt the OPTION_RES on the new connection.
+// mid-packet, so it also pins that a half-read packet is dropped with the
+// connection rather than corrupting the OPTION_RES on the new one.
 func TestOptionReplayedAfterReconnect(t *testing.T) {
 	s := newFakeServer(t)
 	defer s.close()
@@ -514,10 +514,7 @@ func TestProcessLoopOptionOrdering(t *testing.T) {
 			wantState: exceptionsPending, wantErrs: 1,
 		},
 	} {
-		c := &Client{
-			innerHandler: newResponseHandlerMap(),
-			in:           make(chan *Response, queueSize),
-		}
+		c := &Client{in: make(chan *Response, queueSize)}
 		var mu sync.Mutex
 		var errs []error
 		c.ErrorHandler = func(e error) {
@@ -575,10 +572,7 @@ func TestNewFailsWhenUnreachable(t *testing.T) {
 // It must be dropped quietly instead of reaching the ErrorHandler or upsetting
 // the state.
 func TestLateOptionResIsIgnored(t *testing.T) {
-	c := &Client{
-		innerHandler: newResponseHandlerMap(),
-		in:           make(chan *Response, queueSize),
-	}
+	c := &Client{in: make(chan *Response, queueSize)}
 	var mu sync.Mutex
 	var errs []error
 	c.ErrorHandler = func(e error) {
@@ -787,7 +781,7 @@ func TestWriteToPropagatesError(t *testing.T) {
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	conn.Close()
 
-	if err := writeTo(rw, getOptionReq(optionExceptions)); err == nil {
+	if err := writeTo(rw, encodeRequestString(dtOptionReq, optionExceptions)); err == nil {
 		t.Error("writeTo on a closed connection returned nil, want an error")
 	}
 
@@ -799,14 +793,13 @@ func TestWriteToPropagatesError(t *testing.T) {
 	}
 	rw2 := bufio.NewReadWriter(bufio.NewReader(conn2), bufio.NewWriter(conn2))
 	conn2.Close()
-	if err := writeTo(rw2, getOptionReq(strings.Repeat("x", 1<<16))); err == nil {
+	if err := writeTo(rw2, encodeRequestString(dtOptionReq, strings.Repeat("x", 1<<16))); err == nil {
 		t.Error("writeTo of a large payload on a closed connection returned nil, want an error")
 	}
 }
 
-// TestPartialPacketReassembly feeds a packet in two chunks so readLoop has to
-// carry the first half in leftdata. That buffer is what connect()'s redial path
-// resets, so this pins the normal reassembly it must not disturb.
+// TestPartialPacketReassembly delivers one packet in three chunks, none of them
+// on a packet boundary, and pins that it still reaches the handler whole.
 func TestPartialPacketReassembly(t *testing.T) {
 	s := newFakeServer(t)
 	defer s.close()
@@ -819,10 +812,8 @@ func TestPartialPacketReassembly(t *testing.T) {
 		case dtSubmitJob:
 			conn.Write(resPacket(dtJobCreated, []byte(handle)))
 			pkt := resPacket(dtWorkException, []byte(handle+"\x00split payload"))
-			// Three chunks, to hit both halves of the reassembly: the first is
-			// shorter than a header, so readLoop cannot even look at it; the
-			// second makes a header but not a whole packet, so the decode
-			// fails and the remainder is carried over.
+			// The first chunk is shorter than a header and the second ends
+			// mid-body, so both ReadFull calls have to block for a remainder.
 			for _, chunk := range [][]byte{
 				pkt[:6], pkt[6 : len(pkt)-6], pkt[len(pkt)-6:],
 			} {
@@ -867,7 +858,7 @@ func TestPartialPacketReassembly(t *testing.T) {
 // the old write() that stayed behind when writeTo was split off.
 func TestWriteWithoutConnection(t *testing.T) {
 	c := &Client{}
-	if err := c.write(getOptionReq(optionExceptions)); err != ErrLostConn {
+	if err := c.write(encodeRequestString(dtOptionReq, optionExceptions)); err != ErrLostConn {
 		t.Errorf("write without a connection returned %v, want ErrLostConn", err)
 	}
 }

@@ -85,21 +85,20 @@ func decodeResponse(data []byte) (resp *Response, l int, err error) {
 		resp.Handle = string(dt)
 	case dtStatusRes, dtWorkData, dtWorkWarning, dtWorkStatus,
 		dtWorkComplete, dtWorkException:
-		s := bytes.SplitN(dt, []byte{'\x00'}, 2)
-		if len(s) >= 2 {
-			resp.Handle = string(s[0])
-			resp.Data = s[1]
-		} else {
+		i := bytes.IndexByte(dt, '\x00')
+		if i < 0 {
 			err = fmt.Errorf("Invalid data: %v", data)
 			return
 		}
+		resp.Handle = string(dt[:i])
+		resp.Data = dt[i+1:]
 	case dtWorkFail:
-		s := bytes.SplitN(dt, []byte{'\x00'}, 2)
-		if len(s) >= 1 {
-			resp.Handle = string(s[0])
+		// The body is the handle alone, but a separator has always been
+		// tolerated here.
+		if i := bytes.IndexByte(dt, '\x00'); i >= 0 {
+			resp.Handle = string(dt[:i])
 		} else {
-			err = fmt.Errorf("Invalid data: %v", data)
-			return
+			resp.Handle = string(dt)
 		}
 	case dtEchoRes, dtOptionRes:
 		// Both carry a single opaque argument and no job handle: the echoed
@@ -137,23 +136,36 @@ func (resp *Response) Status() (status *Status, err error) {
 
 // status handler
 func (resp *Response) _status() (status *Status, err error) {
-	data := bytes.SplitN(resp.Data, []byte{'\x00'}, 4)
-	if len(data) != 4 {
+	// Four fields; the last keeps any further separators, as a 4-way split did.
+	var f [4][]byte
+	rest := resp.Data
+	for i := 0; i < 3; i++ {
+		j := bytes.IndexByte(rest, '\x00')
+		if j < 0 {
+			err = fmt.Errorf("Invalid data: %v", resp.Data)
+			return
+		}
+		f[i], rest = rest[:j], rest[j+1:]
+	}
+	f[3] = rest
+	// Both flags are read by first byte, so an empty one is malformed input
+	// rather than false.
+	if len(f[0]) == 0 || len(f[1]) == 0 {
 		err = fmt.Errorf("Invalid data: %v", resp.Data)
 		return
 	}
 	status = &Status{}
 	status.Handle = resp.Handle
-	status.Known = (data[0][0] == '1')
-	status.Running = (data[1][0] == '1')
-	status.Numerator, err = strconv.ParseUint(string(data[2]), 10, 0)
+	status.Known = (f[0][0] == '1')
+	status.Running = (f[1][0] == '1')
+	status.Numerator, err = strconv.ParseUint(string(f[2]), 10, 0)
 	if err != nil {
-		err = fmt.Errorf("Invalid Integer: %s", data[2])
+		err = fmt.Errorf("Invalid Integer: %s", f[2])
 		return
 	}
-	status.Denominator, err = strconv.ParseUint(string(data[3]), 10, 0)
+	status.Denominator, err = strconv.ParseUint(string(f[3]), 10, 0)
 	if err != nil {
-		err = fmt.Errorf("Invalid Integer: %s", data[3])
+		err = fmt.Errorf("Invalid Integer: %s", f[3])
 		return
 	}
 	return

@@ -4,10 +4,10 @@ const (
 	Network = "tcp"
 	// queue size
 	queueSize = 8
-	// read buffer size
-	bufferSize = 8192
 	// min packet length
 	minPacketLength = 12
+	// largest body readPacket will allocate from a declared length
+	maxPacketLength = 64 << 20
 
 	// \x00REQ
 	req    = 5391697

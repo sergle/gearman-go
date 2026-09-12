@@ -58,6 +58,12 @@ rather than a duration so two runs stay comparable when the code gets faster.
 Compare medians across `-count` runs: single runs of anything concurrent here
 vary by more than the effects being measured.
 
+**A `$` in `BENCH` is eaten by make.** `make bench BENCH='ClientDo$|ClientEcho'`
+expands `$|` as an empty variable and runs `-bench 'ClientDoClientEcho'`, which
+matches nothing and exits 0 — the same shape of silent no-op as `go test
+-integration ./client` above. Anchor with `$$` (`ClientDo$$|ClientEcho`) or call
+`go test -bench` directly.
+
 `go vet ./...` reports two pre-existing `unreachable code` findings
 (in `client/client.go` and `client/pool_test.go`) and therefore exits
 non-zero. `make vet` filters exactly those and fails on anything new, so prefer
@@ -204,16 +210,47 @@ re-requested on every reconnect — gearmand keeps it per connection.
 
 `New` then starts two goroutines that run for the client's lifetime:
 
-- `readLoop` — reads bytes off `rw`, re-frames them into packets (it buffers a
-  partial tail in `leftdata` and re-parses, because a TCP read does not align
-  to packet boundaries), and pushes `*Response` onto the `in` channel.
+- `readLoop` — calls `readPacket` for one whole packet at a time and pushes
+  `*Response` onto the `in` channel. `readPacket` frames by declared length, as
+  `worker/agent.go` does: `io.ReadFull` the 12-byte header, reject a magic that
+  is not `\x00RES` or a body over `maxPacketLength`, then `io.ReadFull` exactly
+  that many bytes into one slice holding header and body. It returns a whole
+  packet or an error, never a fragment, so there is no `leftdata` tail — do not
+  reintroduce one.
+
+  A packet per allocation is what keeps `decodeResponse`'s aliasing safe:
+  `Response.Data` is a subslice of that packet, so each response owns its bytes.
+  Reusing one read buffer would make every `Data` a view into recycled memory.
+
+  A `decodeResponse` failure no longer means "not enough bytes yet" — the packet
+  is whole and length-checked, so it is a malformed body and the stream is still
+  in sync. `readLoop` reports it and takes the next packet.
+
+  In the error path, a **permanent** `*net.OpError` breaks the loop rather than
+  redialing. That is the socket `Close()` just took; redialing there resurrects
+  a client the caller shut down. Everything else — `io.EOF`,
+  `io.ErrUnexpectedEOF`, a framing error, a temporary `OpError` — closes and
+  redials, because a half-read packet cannot be resumed mid-stream. A nil `rw`
+  still reaches that redial as `ErrLostConn`, so the resurrection is only half
+  closed off; known and still open.
 - `processLoop` — drains `in` and dispatches by `DataType`.
 
-Responses are correlated by a **fixed key**, not by request identity:
-`innerHandler` is keyed `"c"` for the next job-created, `"e"` for echo, and
-`"s"+handle` for status. `processLoop` moves the caller's handler into its own
-`rhandlers` map keyed by the real job handle once the server assigns one
-(`handleInner`, `client.go:368`).
+Responses are correlated by **position, not by request identity**, and
+`client.handlers` (`responseHandlers`) says so in its shape: `created` and
+`echo` are each a `handlerSlot` holding exactly one handler, because
+`JOB_CREATED` and `ECHO_RES` carry no correlation id; `status` is a map keyed by
+the job handle, which `STATUS_RES` does carry. Each member locks itself — no
+operation spans two.
+
+`take` empties a slot and returns what was in it, or the zero value when it was
+empty; `deliver` then runs the handler **outside** that lock, and moves the
+caller's external handler into `processLoop`'s own `rhandlers` map keyed by the
+real job handle once the server assigns one. Never call a handler while holding
+the slot lock.
+
+One slot per packet type means a timed-out caller's late reply can satisfy the
+next one. Known and still open; the fix is a FIFO inside `handlerSlot`, which is
+why both slots share that one type.
 
 Those fixed slots are why `do`, `Status` and `Echo` each hold `client.Mutex`
 across the **entire** round trip — write, then block on the result channel
@@ -300,5 +337,13 @@ calls `client.Lock()` externally). Match it in existing files rather than
 modernising.
 
 `getBuffer` in both `common.go` files is a plain `make([]byte, l)` with a
-`TODO` about pooling; `getRequest`/`getOutPack` likewise. They are hooks for a
-pool that was never written, not actual pools.
+`TODO` about pooling; the worker's `getOutPack` likewise. They are hooks for a
+pool that was never written, not actual pools. The client has no `getRequest`:
+`request.go` frames each packet in one buffer through `newPacket`, with no
+intermediate struct.
+
+A pool behind the client's `getBuffer` would now be safe on the **encode** side
+— `newPacket` fills the header and every encoder writes the whole body,
+separators included. It is still unsafe on the **read** side: `decodeResponse`
+aliases the read buffer, so `Response.Data` would become a view into recycled
+memory.
