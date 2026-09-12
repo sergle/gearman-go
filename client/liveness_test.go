@@ -226,6 +226,46 @@ func TestDoHandlerDoesNotWriteReturnsAfterTimeout(t *testing.T) {
 	}
 }
 
+// do, Status and Echo share one time.Timer on the Client, reset per call rather
+// than allocated per call. This is what that costs if the Go version is wrong.
+//
+// The dangerous interleaving is: a response wins the select, the timer fires in
+// the gap before the deferred Stop, and Stop therefore cannot take it back. Under
+// pre-1.23 timer semantics the fired value stays on the buffered channel and the
+// *next* caller's Reset does not clear it -- so that caller reads an immediate
+// timeout and gets ErrLostConn from a perfectly healthy server.
+//
+// `go 1.23` in go.mod is the fix, and this test is its guard: it fails under
+// GODEBUG=asynctimerchan=1, which restores the old semantics. Driving the same
+// thing through a socket does not work -- the window between the select and the
+// Stop is microseconds, and a fake server answering on a timer boundary misses
+// it in hundreds of rounds -- so the sequence is constructed directly instead.
+//
+// Building the Client literally is also the test for the lazy init: startTimer
+// must work on a zero Client, which is what New's absence here provides.
+func TestSharedResponseTimerResetClearsAPendingFire(t *testing.T) {
+	c := &Client{ResponseTimeout: time.Millisecond}
+	c.Lock()
+	defer c.Unlock()
+
+	// Caller A arms it and never receives: its response won the race.
+	c.startTimer()
+	time.Sleep(20 * time.Millisecond) // long enough that it has certainly fired
+	c.stopTimer()
+
+	// Caller B arms the same timer with a timeout it cannot legitimately reach.
+	c.ResponseTimeout = time.Hour
+	timeout := c.startTimer()
+	defer c.stopTimer()
+	select {
+	case <-timeout:
+		t.Fatal("Reset did not clear the fire left by the previous caller: " +
+			"the next do/Status/Echo would return ErrLostConn immediately. " +
+			"go.mod needs `go 1.23` or later")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 // lateJobCreatedServer answers OPTION_REQ at once -- connect() sends it first
 // on every connection and blocks the handshake otherwise -- and every
 // SUBMIT_JOB after delay.

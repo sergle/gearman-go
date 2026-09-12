@@ -7,7 +7,9 @@
 // working tree, not a published version.
 module github.com/sergle/gearman-go/example
 
-go 1.21
+// Tracks the library's floor; a module cannot require a dependency whose go
+// directive is higher than its own. See the comment in ../go.mod.
+go 1.23
 
 require (
 	github.com/mikespook/golib v0.0.0-20151119134446-38fe6917d34b

@@ -260,6 +260,21 @@ serialises the one shared `bufio.Writer`:
 > Every `client.write` call site holds `client.Mutex`. `connect()` is the only
 > exception, and only because its `rw` is not published by `setConn` yet.
 
+That one-at-a-time property is also what lets all three share a single
+`time.Timer` on the `Client` rather than allocating one per call (three
+allocations, which is why). `startTimer` / `stopTimer` are only ever called
+under `client.Mutex`, and `stopTimer` is deferred *inside* it so the next
+caller's `Reset` cannot run first. The timer is created on first use, not in
+`New` — the zero `Client` is constructible and tests build one.
+
+**This is why `go.mod` says `go 1.23`.** Before that version `Reset` did not
+clear a value already sent on the channel, so a response that raced the fire
+left a stale tick and the *next* caller read it as an immediate timeout —
+`ErrLostConn` from a healthy server. `TestSharedResponseTimerResetClearsAPendingFire`
+is the guard and fails under `GODEBUG=asynctimerchan=1`; `example/go.mod` tracks
+the same floor because a module cannot require a dependency whose directive is
+higher than its own. Do not lower either.
+
 So a `Do` and an `Echo` on one `Client` cannot overlap at all — deliberately.
 The invariant this creates governs the whole file:
 

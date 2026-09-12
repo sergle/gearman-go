@@ -72,6 +72,16 @@ type Client struct {
 	// Echo(). All three return ErrLostConn when it fires.
 	ResponseTimeout time.Duration
 
+	// timer backs that wait. One timer serves all three methods because each
+	// holds client.Mutex from its write until the reply, so at most one wait is
+	// ever in flight -- the same invariant that makes the fixed handler slots
+	// work. A fresh time.NewTimer costs three allocations a call.
+	//
+	// Created on first use rather than in New(): the zero Client is
+	// constructible and the tests build one. The lazy init and every
+	// Reset/Stop happen under client.Mutex.
+	timer *time.Timer
+
 	ErrorHandler ErrorHandler
 }
 
@@ -406,6 +416,28 @@ func (client *Client) processLoop() {
 	}
 }
 
+// startTimer arms the shared response timer and returns its channel. The caller
+// holds client.Mutex, so the reuse is single-threaded by construction.
+//
+// Reusing the timer requires `go 1.23` or later in go.mod. Before that, Reset
+// did not clear a value already sent on the channel, so a response that raced
+// the fire left a stale tick for the next caller to receive as an immediate
+// timeout. TestSharedResponseTimerDoesNotFireForTheNextCaller is the guard.
+func (client *Client) startTimer() <-chan time.Time {
+	if client.timer == nil {
+		client.timer = time.NewTimer(client.ResponseTimeout)
+	} else {
+		client.timer.Reset(client.ResponseTimeout)
+	}
+	return client.timer.C
+}
+
+// stopTimer disarms it. Defer this *inside* client.Mutex -- the next caller's
+// Reset must not run before it.
+func (client *Client) stopTimer() {
+	client.timer.Stop()
+}
+
 func (client *Client) err(e error) {
 	if client.ErrorHandler != nil {
 		client.ErrorHandler(e)
@@ -453,14 +485,15 @@ func (client *Client) do(funcname string, data []byte, flag uint32, h ResponseHa
 		client.handlers.created.cancel()
 		return
 	}
-	// NewTimer with a Stop, not time.After: an unstopped timer stays live for
-	// the whole ResponseTimeout after an early return.
-	timer := time.NewTimer(client.ResponseTimeout)
-	defer timer.Stop()
+	// The shared timer, reset rather than allocated: a round trip is
+	// microseconds against a default of a second, and a per-call time.After
+	// would both allocate and stay live for all of it.
+	timeout := client.startTimer()
+	defer client.stopTimer()
 	select {
 	case ret := <-result:
 		return ret.handle, ret.err
-	case <-timer.C:
+	case <-timeout:
 		client.handlers.created.cancel()
 		return "", ErrLostConn
 	}
@@ -511,14 +544,14 @@ func (client *Client) Status(handle string) (status *Status, err error) {
 		client.handlers.status.cancel(handle)
 		return nil, err
 	}
-	timer := time.NewTimer(client.ResponseTimeout) // stopped, see do
-	defer timer.Stop()
+	timeout := client.startTimer() // shared and reset, see do
+	defer client.stopTimer()
 	select {
 	case ret := <-result:
 		// A malformed STATUS_RES goes to the caller, not ErrorHandler: they
 		// asked, and reporting both ways fires the handler needlessly.
 		return ret.status, ret.err
-	case <-timer.C:
+	case <-timeout:
 		client.handlers.status.cancel(handle)
 		return nil, ErrLostConn
 	}
@@ -541,12 +574,12 @@ func (client *Client) Echo(data []byte) (echo []byte, err error) {
 		client.handlers.echo.cancel()
 		return nil, err
 	}
-	timer := time.NewTimer(client.ResponseTimeout) // stopped, see do
-	defer timer.Stop()
+	timeout := client.startTimer() // shared and reset, see do
+	defer client.stopTimer()
 	select {
 	case ret := <-result:
 		return ret, nil
-	case <-timer.C:
+	case <-timeout:
 		client.handlers.echo.cancel()
 		return nil, ErrLostConn
 	}
