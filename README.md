@@ -7,30 +7,42 @@ The protocols were written in pure Go. It contains two sub-packages:
 The client package is used for sending jobs to the Gearman job server,
 and getting responses from the server.
 
-	"github.com/mikespook/gearman-go/client"
+	"github.com/sergle/gearman-go/client"
 
 The worker package will help developers in developing Gearman worker
 service easily.
 
-	"github.com/mikespook/gearman-go/worker"
+	"github.com/sergle/gearman-go/worker"
 
-[![Build Status](https://travis-ci.org/mikespook/gearman-go.png?branch=master)](https://travis-ci.org/mikespook/gearman-go)
-[![GoDoc](https://godoc.org/github.com/mikespook/gearman-go?status.png)](https://godoc.org/github.com/mikespook/gearman-go)
+Fork
+====
+
+This is a fork of [mikespook/gearman-go](https://github.com/mikespook/gearman-go),
+which is a GOPATH-era repository with no `go.mod`. This one is a proper module
+and carries fixes upstream does not have — several data races, lost packet
+framing on a split read, a `Pool` that could spin or crash when reconfigured,
+and `Status`/`Echo` blocking forever against a silent server.
+
+**Requires Go 1.23 or later.**
+
+**The client API is not compatible with upstream.** `Client.ErrorHandler` was an
+exported field that could not be assigned without racing the client's own read
+of it; it is gone, replaced by the option and setter shown below. Worker
+exceptions also arrive differently — see *Upgrading*.
 
 Install
 =======
 
-Install the client package:
+> $ go get github.com/sergle/gearman-go
 
-> $ go get github.com/mikespook/gearman-go/client
-	
-Install the worker package:
+Existing code importing the upstream path can keep its imports by replacing the
+module instead:
 
-> $ go get github.com/mikespook/gearman-go/worker
+```
+require github.com/mikespook/gearman-go v0.0.0
 
-Both of them:
-
-> $ go get github.com/mikespook/gearman-go
+replace github.com/mikespook/gearman-go => github.com/sergle/gearman-go v0.1.0
+```
 
 Usage
 =====
@@ -136,16 +148,17 @@ the job function returns a non-empty `data` *and* an error. `return nil, err`
 still produces a `WORK_FAIL`, and the text of `err` never goes over the wire —
 put anything the client needs to see in `data`.
 
-Branches
-========
+Versioning
+==========
 
 Version 0.x means: _It is far far away from stable._
 
 __Use at your own risk!__
 
- * master current usable version
- * 0.2-dev Refactoring a lot of things
- * 0.1-testing Old API and some known issues, eg. [issue-14](https://github.com/mikespook/gearman-go/issues/14)
+Below v1 a minor bump may break the API, and this one will: known defects still
+open include correlation by fixed handler slot (a late response can satisfy the
+wrong caller) and a re-dial that can resurrect a connection the caller closed.
+Pin an exact version.
 
 Contributors
 ============
@@ -171,6 +184,10 @@ Great thanks to all of you for your support and interest!
 
 Maintainer
 ==========
+
+This fork: [sergle/gearman-go](https://github.com/sergle/gearman-go).
+
+Original project:
 
  * [Xing Xing](http://mikespook.com) &lt;<mikespook@gmail.com>&gt; [@Twitter](http://twitter.com/mikespook)
 
