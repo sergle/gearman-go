@@ -111,10 +111,10 @@ ci: check ## Alias for check
 
 # --- targets that are expected to fail while the defects are unfixed --------
 
-race: ## Full suite under -race (FAILS today: the client has known races)
+race: ## Full suite under -race (green since §1, bar §7's flake)
 	$(GO) test -race -count=1 -timeout $(TIMEOUT) $(PKGS)
 
-reproducers: ## The three documented race reproducers (expected FAIL)
+reproducers: ## The three documented race reproducers (all green since §1)
 	$(GO) test -race -count=1 -timeout $(TIMEOUT) ./client -run TestRace
 
 # No -run filter on purpose: the -knownbugs gate already selects them, so new

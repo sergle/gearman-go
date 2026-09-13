@@ -30,19 +30,25 @@ Use the Makefile; `make help` lists everything.
 make check                           # build + vet + fmt-check + test + examples
 make test                            # default suite, no gearmand
 make knownbugs                       # tests describing unfixed defects, if any exist
-make reproducers                     # the three race reproducers — expected to FAIL
+make reproducers                     # the three race reproducers — all green since §1
 make bench                           # benchmarks vs the fake servers, no gearmand
 go test -run TestClientDo ./client    # single test
 ```
 
 `make check` is the gate that must pass. `make race`, `make knownbugs` and
-`make reproducers` exist to fail: each one runs tests that describe behaviour
-the code does not have yet, so a red run is the expected state and making one
-green by weakening its test defeats the point. Which cases fail changes as
-fixes land, so read the per-test output rather than the exit code. Each test
-carries the defect it describes in its own comment. `make knownbugs` passing
-means only that no failing test is currently written for a known defect, not
-that none are open: `docs/todo.md` is the defect list, and this file does not
+`make reproducers` were all written to fail: each runs tests describing
+behaviour the code did not have yet, so a red run was the expected state and
+making one green by weakening its test defeats the point. **Which cases fail
+changes as fixes land, so read the per-test output rather than the exit code.**
+Each test carries the defect it describes in its own comment.
+
+As of §1 that has inverted for two of them: `make reproducers` is **green** —
+all three race reproducers now pass and stand as regression tests — and
+`make race` is green apart from §7's probabilistic flake
+(`TestCloseIsIdempotentAndSubsequentCallsFail`, a few subtest assertions per 50
+runs). Do not read a green run of either as a broken target. `make knownbugs`
+passing means only that no failing test is currently written for a known defect,
+not that none are open: `docs/todo.md` is the defect list, and this file does not
 track it.
 
 `make bench` is the same bargain in benchmark form: a case whose defect makes
@@ -207,6 +213,13 @@ The Gearman wire constants (`dtCanDo`, `dtWorkComplete`, packet framing,
 guarantees it is the first packet on the wire; do not move that write after
 `setConn`. `connect()` is also what `readLoop` re-dials with, so the option is
 re-requested on every reconnect — gearmand keeps it per connection.
+
+`New` is variadic (`opts ...Option`), applied before `connect()`. There is no
+exported `ErrorHandler` field — `readLoop`/`processLoop` read it from their own
+goroutines, which `New` starts, so a plain field could never be assigned
+race-free. `WithErrorHandler` installs it as an `Option`, before those
+goroutines start; `SetErrorHandler` changes it later, safe to call
+concurrently. Both go through an internal `atomic.Pointer[ErrorHandler]`.
 
 `New` then starts two goroutines that run for the client's lifetime:
 

@@ -82,7 +82,33 @@ type Client struct {
 	// Reset/Stop happen under client.Mutex.
 	timer *time.Timer
 
-	ErrorHandler ErrorHandler
+	// Read by err() from readLoop/processLoop, which New starts before it
+	// returns: an exported field could never be assigned race-free, hence
+	// atomic and hence the setter.
+	errorHandler atomic.Pointer[ErrorHandler]
+}
+
+// Option configures a Client in New, before its goroutines start.
+type Option func(*Client)
+
+// WithErrorHandler installs the error handler before readLoop can report
+// anything. SetErrorHandler changes it later.
+func WithErrorHandler(h ErrorHandler) Option {
+	return func(client *Client) {
+		client.SetErrorHandler(h)
+	}
+}
+
+// SetErrorHandler installs or replaces the error handler. Safe while the client
+// is running; nil disables it.
+func (client *Client) SetErrorHandler(h ErrorHandler) {
+	if h == nil {
+		// Normalised here so "absent" has one representation and err() needs
+		// only the pointer check.
+		client.errorHandler.Store(nil)
+		return
+	}
+	client.errorHandler.Store(&h)
 }
 
 // ExceptionsEnabled reports whether the job server acknowledged the
@@ -194,14 +220,18 @@ func (s *statusHandlers) cancel(handle string) {
 	delete(s.m, handle)
 }
 
-// New returns a client.
-func New(network, addr string) (client *Client, err error) {
+// New returns a client. Options are applied before connect(), so a handler
+// installed through one also sees handshake errors.
+func New(network, addr string, opts ...Option) (client *Client, err error) {
 	client = &Client{
 		net:             network,
 		addr:            addr,
 		in:              make(chan *Response, queueSize),
 		wantExceptions:  DefaultExceptions,
 		ResponseTimeout: DefaultTimeout,
+	}
+	for _, opt := range opts {
+		opt(client)
 	}
 	if err = client.connect(); err != nil {
 		return nil, err
@@ -439,8 +469,8 @@ func (client *Client) stopTimer() {
 }
 
 func (client *Client) err(e error) {
-	if client.ErrorHandler != nil {
-		client.ErrorHandler(e)
+	if h := client.errorHandler.Load(); h != nil {
+		(*h)(e)
 	}
 }
 

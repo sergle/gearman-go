@@ -128,8 +128,8 @@ func TestStatusTimesOutWhenServerNeverAnswers(t *testing.T) {
 // the old code the second OPTION_REQ cannot appear until the parked Do gives
 // up, and re-dialling a live loopback listener takes well under a millisecond.
 //
-// No ErrorHandler on purpose: readLoop calls client.err() from its own
-// goroutine, and installing one after New() races that read. Still open.
+// No handler installed: this asserts re-dial timing only, and err() with none
+// is a no-op.
 func TestRedialNotBlockedByInFlightDo(t *testing.T) {
 	s := newFakeJobServer(t)
 	s.SetSilent(true)
@@ -216,7 +216,7 @@ func TestDoHandlerDoesNotWriteReturnsAfterTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	c.ErrorHandler = func(error) {}
+	c.SetErrorHandler(func(error) {})
 	c.ResponseTimeout = timeout
 
 	for i := 0; i < rounds; i++ {

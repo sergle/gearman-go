@@ -49,9 +49,9 @@ func TestClientAddServer(t *testing.T) {
 	if client, err = New(Network, "127.0.0.1:4730"); err != nil {
 		t.Fatal(err)
 	}
-	client.ErrorHandler = func(e error) {
+	client.SetErrorHandler(func(e error) {
 		t.Log(e)
-	}
+	})
 }
 
 func TestClientEcho(t *testing.T) {
@@ -301,10 +301,10 @@ func TestClientMultiDo(t *testing.T) {
 	errCh := make(chan error)
 	gotCh := make(chan string, nreqs)
 
-	olderrh := client.ErrorHandler
-	client.ErrorHandler = func(e error) { errCh <- e }
+	olderrh := client.errorHandler.Load() // same package: direct atomic access to save/restore
+	client.SetErrorHandler(func(e error) { errCh <- e })
 	client.ResponseTimeout = 5 * time.Second
-	defer func() { client.ErrorHandler = olderrh }()
+	defer client.errorHandler.Store(olderrh)
 
 	nextJobCh := make(chan struct{})
 	defer close(nextJobCh)

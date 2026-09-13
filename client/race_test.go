@@ -53,20 +53,18 @@ func hostileServer(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// TestRaceErrorHandler: err() reads client.ErrorHandler from readLoop, which
-// New starts before it returns. The only documented way to install a handler is
-// to assign the field afterwards, so the documented usage always races that
-// read. An API flaw, not a missing lock — still open, so this one fails.
+// TestRaceErrorHandler: err() reads the handler from readLoop, which New starts
+// before it returns, so the old exported ErrorHandler field could only ever be
+// assigned after that read was already live. The field is gone; this is now the
+// regression test, using the documented race-free usage.
 func TestRaceErrorHandler(t *testing.T) {
 	addr := hostileServer(t)
 
-	c, err := New(Network, addr)
+	c, err := New(Network, addr, WithErrorHandler(func(error) {}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-
-	c.ErrorHandler = func(error) {} // the documented usage
 
 	// Give readLoop time to fail its read and call err().
 	time.Sleep(200 * time.Millisecond)

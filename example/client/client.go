@@ -13,15 +13,14 @@ func main() {
 	// by implementing IdGenerator interface.
 	// client.IdGen = client.NewAutoIncId()
 
-	c, err := client.New(client.Network, "127.0.0.1:4730")
+	c, err := client.New(client.Network, "127.0.0.1:4730", client.WithErrorHandler(func(e error) {
+		log.Println(e)
+		os.Exit(1)
+	}))
 	if err != nil {
 		log.Fatalln(err)
 	}
 	defer c.Close()
-	c.ErrorHandler = func(e error) {
-		log.Println(e)
-		os.Exit(1)
-	}
 	echo := []byte("Hello\x00 world")
 	echomsg, err := c.Echo(echo)
 	if err != nil {

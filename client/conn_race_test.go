@@ -50,7 +50,7 @@ func TestCloseDuringReadLoopIsRaceFree(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
-		c.ErrorHandler = func(error) {}
+		c.SetErrorHandler(func(error) {})
 		if err := c.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
 		}

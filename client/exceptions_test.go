@@ -234,7 +234,7 @@ func TestHandshakeFirstPacketIsOptionReq(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer c.Close()
-	c.ErrorHandler = func(error) {}
+	c.SetErrorHandler(func(error) {})
 
 	if _, err := c.Echo([]byte("hi")); err != nil {
 		t.Fatalf("Echo: %v", err)
@@ -270,11 +270,11 @@ func TestHandshakeRefusedDegradesSilently(t *testing.T) {
 
 	var mu sync.Mutex
 	var errs []error
-	c.ErrorHandler = func(e error) {
+	c.SetErrorHandler(func(e error) {
 		mu.Lock()
 		errs = append(errs, e)
 		mu.Unlock()
-	}
+	})
 
 	// Echo round-trips only after the ERROR has been processed, so by the time
 	// it returns the ErrorHandler would have fired if it were going to.
@@ -312,7 +312,7 @@ func TestHandshakeIgnoredByServer(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer c.Close()
-	c.ErrorHandler = func(error) {}
+	c.SetErrorHandler(func(error) {})
 
 	if _, err := c.Echo([]byte("hi")); err != nil {
 		t.Fatalf("Echo: %v", err)
@@ -337,7 +337,7 @@ func TestOptOut(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer c.Close()
-	c.ErrorHandler = func(error) {}
+	c.SetErrorHandler(func(error) {})
 
 	if _, err := c.Echo([]byte("hi")); err != nil {
 		t.Fatalf("Echo: %v", err)
@@ -379,7 +379,7 @@ func TestWorkExceptionReachesHandler(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer c.Close()
-	c.ErrorHandler = func(error) {}
+	c.SetErrorHandler(func(error) {})
 
 	var mu sync.Mutex
 	var got []*Response
@@ -464,10 +464,7 @@ func TestOptionReplayedAfterReconnect(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer c.Close()
-	// Deliberately no ErrorHandler: the dropped connection makes readLoop call
-	// client.err() from its own goroutine, and assigning the field after New()
-	// -- as the README tells users to -- races with that read. That race is
-	// pre-existing and unrelated to this test; a nil handler is a no-op.
+	// No handler installed: err() with none is a no-op.
 
 	waitFor(t, "a second connection carrying an OPTION_REQ", func() bool {
 		mu.Lock()
@@ -517,11 +514,11 @@ func TestProcessLoopOptionOrdering(t *testing.T) {
 		c := &Client{in: make(chan *Response, queueSize)}
 		var mu sync.Mutex
 		var errs []error
-		c.ErrorHandler = func(e error) {
+		c.SetErrorHandler(func(e error) {
 			mu.Lock()
 			errs = append(errs, e)
 			mu.Unlock()
-		}
+		})
 		stopped := make(chan struct{})
 		go func() {
 			c.processLoop()
@@ -575,11 +572,11 @@ func TestLateOptionResIsIgnored(t *testing.T) {
 	c := &Client{in: make(chan *Response, queueSize)}
 	var mu sync.Mutex
 	var errs []error
-	c.ErrorHandler = func(e error) {
+	c.SetErrorHandler(func(e error) {
 		mu.Lock()
 		errs = append(errs, e)
 		mu.Unlock()
-	}
+	})
 	stopped := make(chan struct{})
 	go func() {
 		c.processLoop()
@@ -663,7 +660,7 @@ func TestConcurrentDo(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer c.Close()
-	c.ErrorHandler = func(error) {}
+	c.SetErrorHandler(func(error) {})
 
 	// Hammer the atomic while processLoop writes it.
 	stop := make(chan struct{})
@@ -737,8 +734,8 @@ func TestExceptionsStateRaceDuringReconnect(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer c.Close()
-	// No ErrorHandler on purpose: assigning it after New races with readLoop's
-	// own read of the field, which the dropped connections would trigger.
+	// No handler installed: this asserts exceptionsState only, and err() with
+	// none is a no-op.
 
 	stop := make(chan struct{})
 	var reader sync.WaitGroup
@@ -829,7 +826,7 @@ func TestPartialPacketReassembly(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer c.Close()
-	c.ErrorHandler = func(error) {}
+	c.SetErrorHandler(func(error) {})
 
 	got := make(chan *Response, 2)
 	if _, err := c.Do("Split", []byte("x"), JobNormal, func(r *Response) {

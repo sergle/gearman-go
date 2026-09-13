@@ -179,6 +179,29 @@ func TestDoWithIdRejectsEmptyId(t *testing.T) {
 	}
 }
 
+// err() is called from readLoop, where nothing can recover a panic, so the two
+// handler-absent states both have to be inert: never installed, and installed
+// then cleared with SetErrorHandler(nil).
+func TestErrorHandlerNilIsInert(t *testing.T) {
+	c := &Client{} // no goroutines: err() is called directly below
+
+	c.err(ErrLostConn) // never installed
+
+	var got error
+	c.SetErrorHandler(func(e error) { got = e })
+	c.err(ErrLostConn)
+	if got != ErrLostConn {
+		t.Fatalf("installed handler got %v, want ErrLostConn", got)
+	}
+
+	got = nil
+	c.SetErrorHandler(nil)
+	c.err(ErrWorkFail)
+	if got != nil {
+		t.Errorf("handler ran after SetErrorHandler(nil), got %v", got)
+	}
+}
+
 // Resubmitting the same unique id coalesces onto the same handle.
 func TestSameIdYieldsSameHandle(t *testing.T) {
 	s := newFakeJobServer(t)

@@ -61,12 +61,11 @@ go w.Work()
 
 ```go
 // ...
-c, err := client.New("tcp4", "127.0.0.1:4730")
+c, err := client.New("tcp4", "127.0.0.1:4730", client.WithErrorHandler(func(e error) {
+	log.Println(e)
+}))
 // ... error handling
 defer c.Close()
-c.ErrorHandler = func(e error) {
-	log.Println(e)
-}
 echo := []byte("Hello\x00 world")
 echomsg, err := c.Echo(echo)
 // ... error handling
