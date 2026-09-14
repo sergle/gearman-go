@@ -170,7 +170,17 @@ func (worker *Worker) Ready() (err error) {
 	if len(worker.agents) == 0 {
 		return ErrNoneAgents
 	}
-	if len(worker.funcs) == 0 {
+	// Snapshot funcs under the lock rather than ranging the map directly:
+	// AddFunc/RemoveFunc/Reset can run concurrently with Ready on another
+	// goroutine. The *jobFunc values themselves are never mutated in place,
+	// only added or removed, so a shallow copy is enough.
+	worker.Lock()
+	funcs := make(jobFuncs, len(worker.funcs))
+	for name, f := range worker.funcs {
+		funcs[name] = f
+	}
+	worker.Unlock()
+	if len(funcs) == 0 {
 		return ErrNoneFuncs
 	}
 	for _, a := range worker.agents {
@@ -178,7 +188,7 @@ func (worker *Worker) Ready() (err error) {
 			return
 		}
 	}
-	for funcname, f := range worker.funcs {
+	for funcname, f := range funcs {
 		worker.addFunc(funcname, f.timeout)
 	}
 	worker.ready = true
@@ -245,7 +255,9 @@ func (worker *Worker) Reset() {
 	outpack := getOutPack()
 	outpack.dataType = dtResetAbilities
 	worker.broadcast(outpack)
+	worker.Lock()
 	worker.funcs = make(jobFuncs)
+	worker.Unlock()
 }
 
 // Set the worker's unique id.
@@ -271,7 +283,13 @@ func (worker *Worker) exec(inpack *inPack) (err error) {
 			}
 		}
 	}()
+	// Snapshot under the lock and call out after releasing it: worker.funcs is
+	// written unlocked by AddFunc/RemoveFunc/Reset from another goroutine while
+	// jobs are in flight, and neither the job function nor the I/O below may run
+	// while worker.Mutex is held.
+	worker.Lock()
 	f, ok := worker.funcs[inpack.fn]
+	worker.Unlock()
 	if !ok {
 		return fmt.Errorf("The function does not exist: %s", inpack.fn)
 	}
@@ -282,7 +300,10 @@ func (worker *Worker) exec(inpack *inPack) (err error) {
 	} else {
 		r = execTimeout(f.f, inpack, time.Duration(f.timeout)*time.Second)
 	}
-	if worker.running {
+	worker.Lock()
+	running := worker.running
+	worker.Unlock()
+	if running {
 		outpack := getOutPack()
 		if r.err == nil {
 			outpack.dataType = dtWorkComplete
