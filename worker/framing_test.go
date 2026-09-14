@@ -75,8 +75,7 @@ func assertPacket(t *testing.T, got readResult, want []byte) {
 }
 
 // The original reproducer, kept unedited apart from its gate so that it stays
-// evidence rather than something reshaped to fit the fix. Full defect writeup
-// in docs/todo.md section 10.
+// evidence rather than something reshaped to fit the fix.
 //
 // The old read took the body length from its first Read. A first read shorter
 // than a header left that length reading as zero, so a fragment came back as a

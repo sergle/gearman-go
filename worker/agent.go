@@ -172,10 +172,16 @@ func (a *agent) reconnect() error {
 // decodeInPack ignores data[0:4]. It rejects \x00REQ-magic packets a job server
 // has no business sending.
 func (a *agent) read() (data []byte, err error) {
-	var hdr [minPacketLength]byte
-	if _, err = io.ReadFull(a.rw, hdr[:]); err != nil {
+	// Peek, not ReadFull into a local array: the array escapes through the
+	// interface Read, one alloc per packet. A truncated header reports io.EOF
+	// here, not io.ErrUnexpectedEOF; work() routes both to disconnect_error.
+	hdr, err := a.rw.Peek(minPacketLength)
+	if err != nil {
 		return nil, err
 	}
+	// Peek does not consume, so a rejected header stays buffered. Safe only
+	// because work()'s generic branch redials; a bare continue there would
+	// re-Peek the same bad header forever.
 	if magic := binary.BigEndian.Uint32(hdr[0:4]); magic != res {
 		return nil, fmt.Errorf("bad packet magic %q, want %q", hdr[0:4], resStr)
 	}
@@ -190,7 +196,9 @@ func (a *agent) read() (data []byte, err error) {
 	// One slice, not two: decodeInPack indexes the header and the body off the
 	// same backing array.
 	data = getBuffer(minPacketLength + int(bodyLen))
-	copy(data, hdr[:])
+	copy(data, hdr)
+	// Cannot short-read: Peek buffered these bytes.
+	a.rw.Discard(minPacketLength)
 	if bodyLen > 0 {
 		if _, err = io.ReadFull(a.rw, data[minPacketLength:]); err != nil {
 			return nil, err
@@ -199,10 +207,34 @@ func (a *agent) read() (data []byte, err error) {
 	return data, nil
 }
 
+// encodeBufPool backs write's packet buffer. Pointer-shaped so Put does not
+// box a slice header, which would cost the allocation this saves.
+var encodeBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 0, encodeBufSize)
+		return &buf
+	},
+}
+
+const (
+	// encodeBufSize covers a WORK_COMPLETE with a small payload.
+	encodeBufSize = 256
+	// encodeBufKeep bounds what is retained: a packet may legally reach
+	// maxPacketLength, and pinning one of those costs more than re-allocating.
+	encodeBufKeep = 64 << 10
+)
+
 // Internal write the encoded job.
 func (a *agent) write(outpack *outPack) (err error) {
 	var n int
-	buf := outpack.Encode()
+	p := encodeBufPool.Get().(*[]byte)
+	buf := outpack.encodeInto(*p)
+	if cap(buf) <= encodeBufKeep {
+		*p = buf
+	}
+	// bufio.Writer does not retain buf past Flush: a large write goes straight
+	// to the connection, a small one is copied in.
+	defer encodeBufPool.Put(p)
 	for i := 0; i < len(buf); i += n {
 		n, err = a.rw.Write(buf[i:])
 		if err != nil {

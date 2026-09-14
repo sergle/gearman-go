@@ -103,21 +103,41 @@ func decodeInPack(data []byte) (inpack *inPack, l int, err error) {
 	inpack = getInPack()
 	inpack.dataType = binary.BigEndian.Uint32(data[4:8])
 	switch inpack.dataType {
+	// Scanned in place, not SplitN: the field slice is an alloc per job.
+	// Assignment stays all-or-nothing -- too few separators leaves every field
+	// zero, which exec relies on -- and the last field keeps its NULs.
 	case dtJobAssign:
-		s := bytes.SplitN(dt, []byte{'\x00'}, 3)
-		if len(s) == 3 {
-			inpack.handle = string(s[0])
-			inpack.fn = string(s[1])
-			inpack.data = s[2]
+		i := bytes.IndexByte(dt, '\x00')
+		if i < 0 {
+			break
 		}
+		j := bytes.IndexByte(dt[i+1:], '\x00')
+		if j < 0 {
+			break
+		}
+		j += i + 1
+		inpack.handle = string(dt[:i])
+		inpack.fn = string(dt[i+1 : j])
+		inpack.data = dt[j+1:]
 	case dtJobAssignUniq:
-		s := bytes.SplitN(dt, []byte{'\x00'}, 4)
-		if len(s) == 4 {
-			inpack.handle = string(s[0])
-			inpack.fn = string(s[1])
-			inpack.uniqueId = string(s[2])
-			inpack.data = s[3]
+		i := bytes.IndexByte(dt, '\x00')
+		if i < 0 {
+			break
 		}
+		j := bytes.IndexByte(dt[i+1:], '\x00')
+		if j < 0 {
+			break
+		}
+		j += i + 1
+		k := bytes.IndexByte(dt[j+1:], '\x00')
+		if k < 0 {
+			break
+		}
+		k += j + 1
+		inpack.handle = string(dt[:i])
+		inpack.fn = string(dt[i+1 : j])
+		inpack.uniqueId = string(dt[j+1 : k])
+		inpack.data = dt[k+1:]
 	default:
 		inpack.data = dt
 	}

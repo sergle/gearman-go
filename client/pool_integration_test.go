@@ -16,7 +16,7 @@ import (
 //
 // Nothing here asserts anything about Rate. SelectWithRate returns on the first
 // item it iterates whenever that rate is positive, so later rates are never
-// consulted (docs/todo.md §6a). The spread is Go's map-iteration order, and it
+// consulted. The spread is Go's map-iteration order, and it
 // is not uniform: a one-bucket map starts at a random slot in 0..7 and wraps, so
 // one server of three is picked ~6/8 of the time and the others ~1/8 each
 // (measured 177/12/11 over 200 submits).

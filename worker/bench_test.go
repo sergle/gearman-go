@@ -22,10 +22,8 @@ import (
 // client-side, so this side exists as a *control*. If these move, the change
 // leaked out of the client package.
 //
-// The allocation figures are per iteration of the benchmark loop, but the work
-// happens on the worker's goroutines, so ReportAllocs here measures the
-// benchmark goroutine only and is not useful. Use -benchmem output from the
-// client benchmarks for allocation questions and these for throughput.
+// -benchmem deltas process-wide MemStats, so the allocation figures are
+// whole-pipeline per-job numbers, not just this goroutine's.
 //
 // Run with: make bench
 

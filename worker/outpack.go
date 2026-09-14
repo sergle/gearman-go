@@ -18,6 +18,14 @@ func getOutPack() (outpack *outPack) {
 
 // Encode a job to byte slice
 func (outpack *outPack) Encode() (data []byte) {
+	return outpack.encodeInto(nil)
+}
+
+// encodeInto encodes into buf when it has the room, allocating otherwise. Every
+// byte of the returned slice is written -- header, handle, the separator after
+// it, body -- so a reused buffer needs no re-zeroing, which is most of what the
+// allocation costs on a large packet.
+func (outpack *outPack) encodeInto(buf []byte) (data []byte) {
 	var l int
 	if outpack.dataType == dtWorkFail {
 		l = len(outpack.handle)
@@ -27,7 +35,11 @@ func (outpack *outPack) Encode() (data []byte) {
 			l += len(outpack.handle) + 1
 		}
 	}
-	data = getBuffer(l + minPacketLength)
+	if n := l + minPacketLength; cap(buf) < n {
+		data = getBuffer(n)
+	} else {
+		data = buf[:n]
+	}
 	binary.BigEndian.PutUint32(data[:4], req)
 	binary.BigEndian.PutUint32(data[4:8], outpack.dataType)
 	binary.BigEndian.PutUint32(data[8:minPacketLength], uint32(l))
