@@ -155,6 +155,11 @@ func (a *agent) PreSleep() {
 }
 
 func (a *agent) reconnect() error {
+	// Built before a.Mutex is taken: this used to be a call into the worker
+	// from inside the critical section, taking a.Mutex then worker.Mutex while
+	// AddFunc/RemoveFunc/Close take them the other way round.
+	outpacks := a.worker.funcOutpacks()
+
 	a.Lock()
 	defer a.Unlock()
 	conn, err := net.Dial(a.net, a.addr)
@@ -165,7 +170,10 @@ func (a *agent) reconnect() error {
 	a.rw = bufio.NewReadWriter(bufio.NewReader(a.conn),
 		bufio.NewWriter(a.conn))
 
-	a.worker.reRegisterFuncsForAgent(a)
+	// Abilities before the grab, as on a fresh connection.
+	for _, outpack := range outpacks {
+		a.write(outpack)
+	}
 	a.grab()
 
 	go a.work()

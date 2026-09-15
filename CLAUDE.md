@@ -336,8 +336,8 @@ be resynchronised in place.
 
 `io.EOF` and `io.ErrUnexpectedEOF` must **not**: `work()` routes both to
 `disconnect_error`, and the distinction matters because the generic branch
-redials without calling `reRegisterFuncsForAgent` or `grab()`. An agent sent
-there comes back with a live socket, no announced abilities and nothing
+redials without re-registering abilities (`funcOutpacks`) or calling `grab()`.
+An agent sent there comes back with a live socket, no announced abilities and nothing
 outstanding — silently idle. Only `*WorkerDisconnectError` reaches
 `ErrorHandler`, and only the caller's `.Reconnect()` re-registers.
 `io.ReadFull` reports a connection that died mid-packet as
@@ -354,7 +354,7 @@ silently stopped grabbing. `worker/framing_test.go` guards it.
 Reconnect is caller-driven: a dropped connection surfaces as
 `*WorkerDisconnectError` passed to `ErrorHandler`, and the handler calls
 `.Reconnect()` on it. `reconnect` re-registers all functions
-(`reRegisterFuncsForAgent`) and starts a fresh `work()` goroutine.
+(`funcOutpacks`) and starts a fresh `work()` goroutine.
 
 ## Conventions
 

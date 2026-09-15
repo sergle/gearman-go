@@ -351,14 +351,19 @@ func (worker *Worker) exec(inpack *inPack) (err error) {
 	}
 	return
 }
-func (worker *Worker) reRegisterFuncsForAgent(a *agent) {
+
+// funcOutpacks builds the registration packets for every known function and
+// returns them rather than writing them: the caller writes under the agent's
+// lock, and holding worker.Mutex across a call into agent is the inversion of
+// the order AddFunc/RemoveFunc/Close take.
+func (worker *Worker) funcOutpacks() (outpacks []*outPack) {
 	worker.Lock()
 	defer worker.Unlock()
+	outpacks = make([]*outPack, 0, len(worker.funcs))
 	for funcname, f := range worker.funcs {
-		outpack := prepFuncOutpack(funcname, f.timeout)
-		a.write(outpack)
+		outpacks = append(outpacks, prepFuncOutpack(funcname, f.timeout))
 	}
-
+	return
 }
 
 // inner result
