@@ -104,10 +104,13 @@ func (a *agent) work() {
 }
 
 func (a *agent) disconnect_error(err error) {
+	// Snapshot, then call worker.err with the lock released: the handler's
+	// documented moves, .Reconnect() and w.Close(), both re-enter a.Mutex.
 	a.Lock()
-	defer a.Unlock()
+	conn := a.conn
+	a.Unlock()
 
-	if a.conn != nil {
+	if conn != nil {
 		err = &WorkerDisconnectError{
 			err:   err,
 			agent: a,
