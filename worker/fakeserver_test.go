@@ -383,10 +383,11 @@ func (s *fakeWorkerServer) Counts() (assigned, completed int) {
 // Work() in its own goroutine (Work blocks, and it is the only place jobs are
 // dispatched).
 //
-// It deliberately does not call Close() at the end: Close closes worker.in
-// while the agent's work() goroutine may still be sending into it
-// (worker.go:231 against agent.go:101), which panics. The fake server's own
-// cleanup drops the connection, which is what ends the agent loop.
+// It deliberately does not call Close() at the end: these tests assert on
+// server-side counts (Results, Counts), not on worker shutdown, and the fake
+// server's own cleanup (t.Cleanup(s.stop)) drops the connection, which is
+// what ends the agent loop. Close() racing a live sender on worker.in used to
+// panic here; that is now covered directly by close_test.go instead.
 func newTestWorker(t testing.TB, s *fakeWorkerServer, fn string, f JobFunc) *Worker {
 	t.Helper()
 	w := New(Unlimited)

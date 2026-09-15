@@ -23,6 +23,11 @@ type Worker struct {
 	in      chan *inPack
 	running bool
 	ready   bool
+	closed  bool
+	// in is never closed: a work() goroutine can be mid-send on it when Close
+	// runs. quit carries the shutdown signal instead, with Close its only
+	// writer, guarded by closed above.
+	quit chan struct{}
 
 	Id           string
 	ErrorHandler ErrorHandler
@@ -42,6 +47,7 @@ func New(limit int) (worker *Worker) {
 		agents: make([]*agent, 0, limit),
 		funcs:  make(jobFuncs),
 		in:     make(chan *inPack, queueSize),
+		quit:   make(chan struct{}),
 	}
 	if limit != Unlimited {
 		worker.limit = make(chan bool, limit-1)
@@ -213,9 +219,23 @@ func (worker *Worker) Work() {
 	for _, a := range worker.agents {
 		a.Grab()
 	}
-	var inpack *inPack
-	for inpack = range worker.in {
-		worker.handleInPack(inpack)
+	for {
+		select {
+		case inpack := <-worker.in:
+			worker.handleInPack(inpack)
+		case <-worker.quit:
+			// Best-effort drain, not a barrier: a sender's own select can
+			// still land a value here. Without it each buffered packet is
+			// left to this select's random pick between two ready cases.
+			for {
+				select {
+				case inpack := <-worker.in:
+					worker.handleInPack(inpack)
+				default:
+					return
+				}
+			}
+		}
 	}
 }
 
@@ -231,13 +251,23 @@ func (worker *Worker) customeHandler(inpack *inPack) {
 // Close connection and exit main loop
 func (worker *Worker) Close() {
 	worker.Lock()
-	defer worker.Unlock()
-	if worker.running == true {
-		for _, a := range worker.agents {
-			a.Close()
-		}
-		worker.running = false
-		close(worker.in)
+	if worker.closed {
+		worker.Unlock()
+		return
+	}
+	worker.closed = true
+	worker.running = false
+	agents := worker.agents
+	worker.Unlock()
+
+	// Before any socket: a sender parked on worker.in is not doing I/O, so
+	// a.Close below cannot reach it.
+	close(worker.quit)
+
+	// Outside worker.Mutex, since agent.Close does I/O. Unconditional, so a
+	// worker that called Ready() but never Work() does not leak its sockets.
+	for _, a := range agents {
+		a.Close()
 	}
 }
 

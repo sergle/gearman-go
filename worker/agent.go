@@ -99,7 +99,13 @@ func (a *agent) work() {
 			continue
 		}
 		inpack.a = a
-		a.worker.in <- inpack
+		// Closing this agent's socket cannot unblock a goroutine parked on a
+		// channel send, so shutdown needs its own signal.
+		select {
+		case a.worker.in <- inpack:
+		case <-a.worker.quit:
+			return
+		}
 	}
 }
 
