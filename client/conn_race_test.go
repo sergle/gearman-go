@@ -4,6 +4,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestCloseDuringReadLoopIsRaceFree guards the synchronisation around
@@ -58,4 +59,54 @@ func TestCloseDuringReadLoopIsRaceFree(t *testing.T) {
 
 	ln.Close()
 	wg.Wait()
+}
+
+// TestCloseDuringRedialDoesNotReconnect covers §7's second route into the
+// resurrection: readLoop can take a genuine transport error, call closeConn,
+// and be about to redial while Close() lands concurrently -- no nil rw is
+// ever observed on this path, unlike the route TestCloseIsIdempotentAndSubsequentCallsFail
+// exercises, so a fix that only patched readPacket's nil-rw check would still
+// resurrect the connection here.
+//
+// There is no hook into readLoop's internal state to land exactly between its
+// closeConn and connect, so this drives the race blind: kill the connection
+// from the server side, which sends readLoop into that window on its own
+// goroutine, and call Close() immediately after on this one. Across enough
+// rounds some land inside the window. A dial already in flight when Close
+// lands is allowed to put one OPTION_REQ on the wire -- setConn's refusal
+// happens after the write, see connect() -- so OptionReqs is not the
+// assertion; whether the client goes on to use that connection is, which
+// getConn and a subsequent call both show directly.
+func TestCloseDuringRedialDoesNotReconnect(t *testing.T) {
+	const rounds = 50
+	s := newFakeJobServer(t)
+
+	for i := 0; i < rounds; i++ {
+		c, err := New(Network, s.Addr())
+		if err != nil {
+			t.Fatalf("round %d: New: %v", i, err)
+		}
+		c.SetErrorHandler(func(error) {})
+		waitFor(t, "handshake before drop", c.ExceptionsEnabled)
+
+		s.DropConnections() // readLoop notices on its own goroutine, asynchronously
+		if err := mustReturnWithin(t, time.Second, "Close racing a redial", c.Close); err != nil {
+			t.Fatalf("round %d: Close: %v", i, err)
+		}
+
+		// Give a dial that raced Close time to come back and try to publish
+		// itself; setConn must keep refusing it for as long as we keep
+		// looking.
+		deadline := time.Now().Add(50 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if c.getConn() != nil {
+				t.Fatalf("round %d: client reconnected after Close", i)
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		if _, err := c.DoBg("f", []byte("x"), JobNormal); err != ErrLostConn {
+			t.Fatalf("round %d: DoBg after Close = %v, want ErrLostConn", i, err)
+		}
+	}
 }

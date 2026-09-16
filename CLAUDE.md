@@ -251,8 +251,15 @@ concurrently. Both go through an internal `atomic.Pointer[ErrorHandler]`.
   a client the caller shut down. Everything else — `io.EOF`,
   `io.ErrUnexpectedEOF`, a framing error, a temporary `OpError` — closes and
   redials, because a half-read packet cannot be resumed mid-stream. A nil `rw`
-  still reaches that redial as `ErrLostConn`, so the resurrection is only half
-  closed off; known and still open.
+  reaches that redial as `ErrLostConn` too, but `readLoop` treats it as
+  terminal rather than redialable: `Client.closed`, set by `Close` and read
+  under `connMu`, is what tells the two apart from an ordinary transport
+  failure. `connect()` refuses to dial once it is set, and `setConn` refuses
+  to publish even a dial that was already in flight when `Close` landed —
+  checked in both places, since a check only before the dial would race it.
+  Both refusals report `ErrLostConn`, and `readLoop` breaks on it without
+  redialing or reporting to `ErrorHandler`, closing off both routes into the
+  resurrection §7 used to describe.
 - `processLoop` — drains `in` and dispatches by `DataType`.
 
 Responses are correlated by **position, not by request identity**, and
@@ -304,15 +311,24 @@ The invariant this creates governs the whole file:
 Connection state therefore has its own lock, `connMu`, reached through
 `getConn` / `getRW` / `setConn` and held only around load/store, never across
 I/O. Do not reuse `client.Mutex` for it — that deadlocks. `Close` takes
-`connMu` only, via `closeConn`, and `readLoop` closes through `closeConn`
-rather than `Close`, for the same reason: `client.Mutex` there would stall the
-re-dial for a whole `ResponseTimeout`, and the caller's response can only
-arrive over the connection being rebuilt.
+`connMu` only — once directly, to set `closed`, and again via `closeConn` — and
+`readLoop` closes through `closeConn` rather than `Close`, for the same
+reason: `client.Mutex` there would stall the re-dial for a whole
+`ResponseTimeout`, and the caller's response can only arrive over the
+connection being rebuilt.
 
-`readLoop` also re-dials internally on error, so a connection the caller closed
-can come back: it closes, reconnects, loops — and the loop condition passes
-because it just reconnected. There is no `closed` flag. Known and still open;
-a clean `-race` run does not mean this is resolved.
+`readLoop` re-dials internally on error, so a connection the caller closed
+could come back: it closes, reconnects, loops, and the loop condition passes
+because it just reconnected. `Client.closed` (see above) is what stops that —
+`readLoop` never checks it directly; it stops via the `getConn() != nil` loop
+condition plus the two `ErrLostConn` breaks in its error path, both fed by
+`connect()`/`setConn()` refusing once `closed` is set. A residual, bounded
+window remains and is deliberate, not a resurrection: `connect()` can pass the
+`closed` check, dial, and write one `OPTION_REQ` before `setConn` refuses and
+closes that connection, so one accepted connection and one packet can still
+reach the job server after `Close` returns. The client never publishes or uses
+that connection — `getConn()` stays nil throughout — so no caller can reach it
+through `Do`, `Status` or `Echo`.
 
 `Pool` wraps N clients with a `SelectionHandler` for server selection. It is
 not a connection pool to one server.

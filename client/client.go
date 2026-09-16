@@ -58,6 +58,11 @@ type Client struct {
 	connMu sync.RWMutex
 	conn   net.Conn
 	rw     *bufio.ReadWriter
+	// closed is set by Close and never cleared. It is what tells connect() and
+	// setConn() apart from an ordinary redial: closeConn() (which every redial
+	// goes through) leaves it alone, so only a caller's Close ever sets it.
+	// Guarded by connMu, not client.Mutex -- readLoop must never take that one.
+	closed bool
 
 	// wantExceptions is a copy of DefaultExceptions taken in New(). It is never
 	// written again, so connect() may read it from readLoop's goroutine without
@@ -141,11 +146,28 @@ func (client *Client) getRW() *bufio.ReadWriter {
 
 // setConn swaps connection and reader/writer in one step, so no observer can
 // ever see an rw that belongs to a different conn.
-func (client *Client) setConn(conn net.Conn, rw *bufio.ReadWriter) {
+//
+// It refuses to publish onto a closed client, closing conn instead: a dial
+// that was already in flight when Close landed must not resurrect the
+// connection Close just tore down. Reports whether it published, so connect()
+// knows not to treat the dial as having succeeded.
+func (client *Client) setConn(conn net.Conn, rw *bufio.ReadWriter) (ok bool) {
 	client.connMu.Lock()
 	defer client.connMu.Unlock()
+	if client.closed {
+		conn.Close()
+		return false
+	}
 	client.conn = conn
 	client.rw = rw
+	return true
+}
+
+// isClosed reports whether Close has been called.
+func (client *Client) isClosed() bool {
+	client.connMu.RLock()
+	defer client.connMu.RUnlock()
+	return client.closed
 }
 
 type handledResponse struct {
@@ -251,7 +273,17 @@ func New(network, addr string, opts ...Option) (client *Client, err error) {
 // makes it the first packet on the wire: no other goroutine can reach this rw
 // yet, so no SUBMIT_JOB can overtake it and no concurrent write can interleave
 // with its bytes. Do not move this write after setConn.
+//
+// connect() refuses to dial once the client is closed, and setConn refuses to
+// publish even if a dial that started before Close lands after it -- checked
+// in both places, since a check only before the dial would race it. Either
+// refusal is reported as ErrLostConn: it is the caller's shutdown, not a
+// transport failure, so readLoop must not treat it as one worth redialing
+// over or reporting to ErrorHandler.
 func (client *Client) connect() (err error) {
+	if client.isClosed() {
+		return ErrLostConn
+	}
 	conn, err := net.Dial(client.net, client.addr)
 	if err != nil {
 		return
@@ -264,14 +296,18 @@ func (client *Client) connect() (err error) {
 		}
 		atomic.StoreInt32(&client.exceptionsState, exceptionsPending)
 	}
-	client.setConn(conn, rw)
+	if !client.setConn(conn, rw) {
+		return ErrLostConn
+	}
 	if client.wantExceptions {
 		// Tell processLoop that the next packet it sees is the answer to the
 		// OPTION_REQ above. client.in is buffered and the only other sender is
 		// readLoop, which is either not running yet (New) or is the goroutine
 		// executing this very call (redial), so this cannot block behind
 		// another packet and it lands after everything from the old
-		// connection.
+		// connection. Only reached once setConn has published, so a refused
+		// connect never sends it -- nothing must send on client.in after
+		// Close, which readLoop's own exit is about to close.
 		client.in <- &Response{DataType: dtOptionSent}
 	}
 	return
@@ -349,6 +385,14 @@ func (client *Client) readLoop() {
 	for client.getConn() != nil {
 		packet, err := client.readPacket(hdr[:])
 		if err != nil {
+			if err == ErrLostConn {
+				// getRW observed a nil rw: Close() cleared it between the loop
+				// condition above and here, not a transport failure. Redialing
+				// is exactly the resurrection this guards against, and it is
+				// not worth reporting to ErrorHandler either -- it is the
+				// caller's own shutdown.
+				break
+			}
 			if opErr, ok := err.(*net.OpError); ok {
 				if opErr.Timeout() {
 					client.err(err)
@@ -371,7 +415,13 @@ func (client *Client) readLoop() {
 			// the connection this loop is rebuilding.
 			client.closeConn()
 			if err = client.connect(); err != nil {
-				client.err(err)
+				if err != ErrLostConn {
+					// ErrLostConn here means Close() landed while this loop
+					// was between closeConn and connect -- the caller's own
+					// shutdown racing a genuine transport error, not a dial
+					// failure worth reporting.
+					client.err(err)
+				}
 				break
 			}
 			continue
@@ -635,7 +685,16 @@ func (client *Client) closeConn() (err error) {
 // Close connection. Deliberately not on client.Mutex: Status and Echo hold it
 // until their response or ResponseTimeout, so locking here would make Close
 // wait out an in-flight request instead of cutting it short.
+//
+// Sets closed before closing, not inside closeConn: closeConn is also what
+// every redial calls, and a redial is not a shutdown. The two locks are
+// separate critical sections -- fine, because a connect() or setConn() racing
+// in between still sees closed once it takes connMu, closeConn is idempotent,
+// and nothing this depends on can observe the gap.
 func (client *Client) Close() (err error) {
+	client.connMu.Lock()
+	client.closed = true
+	client.connMu.Unlock()
 	return client.closeConn()
 }
 
