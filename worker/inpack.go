@@ -53,7 +53,7 @@ func (inpack *inPack) SendData(data []byte) {
 	outpack.data = getBuffer(l)
 	copy(outpack.data, []byte(inpack.handle))
 	copy(outpack.data[hl+1:], data)
-	inpack.a.write(outpack)
+	inpack.a.Write(outpack)
 }
 
 func (inpack *inPack) SendWarning(data []byte) {
@@ -64,7 +64,7 @@ func (inpack *inPack) SendWarning(data []byte) {
 	outpack.data = getBuffer(l)
 	copy(outpack.data, []byte(inpack.handle))
 	copy(outpack.data[hl+1:], data)
-	inpack.a.write(outpack)
+	inpack.a.Write(outpack)
 }
 
 // Update status.
@@ -81,7 +81,7 @@ func (inpack *inPack) UpdateStatus(numerator, denominator int) {
 	copy(outpack.data, []byte(inpack.handle))
 	copy(outpack.data[hl+1:], n)
 	copy(outpack.data[hl+nl+2:], d)
-	inpack.a.write(outpack)
+	inpack.a.Write(outpack)
 }
 
 // Decode job from byte slice

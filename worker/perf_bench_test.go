@@ -347,9 +347,9 @@ func BenchmarkWorkerLimitToken(b *testing.B) {
 
 // --- the job-side writers ---------------------------------------------------
 
-// BenchmarkWorkerInPackWriters prices the three progress reporters. Each calls
-// the unlocked a.write, so anything measured here is measured on the racy path
-// as it stands today.
+// BenchmarkWorkerInPackWriters prices the three progress reporters. Each goes
+// through the locked a.Write, uncontended here: the cost of the lock itself is
+// part of what these three now pay.
 func BenchmarkWorkerInPackWriters(b *testing.B) {
 	_, inpack := perfExecWorker(0, func(Job) ([]byte, error) { return nil, nil })
 	b.Run("SendData", func(b *testing.B) {

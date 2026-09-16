@@ -116,6 +116,13 @@ package and each side speaks the opposite half of the protocol. Its
 (`handle\0fn\0uniq\0data`): with three, `decodeInPack` drops the contents,
 `fn` comes out empty and the worker silently dispatches nothing.
 
+It also **frames what the worker sends**: a packet whose magic is not `\x00REQ`,
+or whose declared body length exceeds `maxPacketLength`, is recorded and readable
+through `FramingErrors()`, and `serve` drops the connection. That is the
+assertion §25's regression test rests on — two unsynchronised writers inside the
+agent's one `bufio.Writer` desync the stream, and correct locking cannot. The
+check is not optional and every existing test on this harness passes with it.
+
 `OPTION_RES` is not optional. `DefaultExceptions` is true, so `connect()` sends
 an `OPTION_REQ` as the **first packet on every connection**, redials included.
 A fake server that ignores it leaves `processLoop` treating the first real

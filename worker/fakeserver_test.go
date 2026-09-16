@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -59,6 +60,7 @@ type fakeWorkerServer struct {
 	payload   []byte           // body of each JOB_ASSIGN_UNIQ
 	fn        string           // funcname of each JOB_ASSIGN_UNIQ
 	chunks    []int            // leading write sizes per response; see SetChunkWrites
+	framing   []string         // packets serve could not frame; see framingError
 }
 
 // send exists so a test can force a packet to arrive in pieces. Over loopback
@@ -159,9 +161,25 @@ func (s *fakeWorkerServer) serve(conn net.Conn) {
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			return // worker hung up, or the test ended
 		}
+		// Whole-packet framing check. Two writers interleaving inside the
+		// agent's one bufio.Writer leave the stream desynced, so the next
+		// header is read off the wrong offset; correct locking cannot produce
+		// either symptom, and neither can a short read, which ReadFull absorbs.
+		// The length is bounded before the body is allocated: a length taken
+		// from payload bytes is usually gigabytes.
+		if magic := binary.BigEndian.Uint32(hdr[0:4]); magic != req {
+			s.framingError("bad packet magic %q, want %q", hdr[0:4], reqStr)
+			return
+		}
+		n := binary.BigEndian.Uint32(hdr[8:12])
+		if n > maxPacketLength {
+			s.framingError("packet body of %d bytes exceeds the %d-byte limit",
+				n, maxPacketLength)
+			return
+		}
 		dataType := binary.BigEndian.Uint32(hdr[4:8])
 		var body []byte
-		if n := binary.BigEndian.Uint32(hdr[8:12]); n > 0 {
+		if n > 0 {
 			body = make([]byte, n)
 			if _, err := io.ReadFull(conn, body); err != nil {
 				return
@@ -349,6 +367,22 @@ func (s *fakeWorkerServer) SetRecord(record bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record = record
+}
+
+// framingError records a packet the worker had no business sending. Not gated
+// on record: it is two comparisons per packet, and a harness that can be told
+// to stop noticing corruption is worth less than the flag saves.
+func (s *fakeWorkerServer) framingError(format string, args ...interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.framing = append(s.framing, fmt.Sprintf(format, args...))
+}
+
+// FramingErrors returns the malformed packets seen so far.
+func (s *fakeWorkerServer) FramingErrors() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.framing...)
 }
 
 // Abilities returns the funcnames registered so far.
