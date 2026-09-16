@@ -39,7 +39,7 @@ func main() {
 	defer log.Println("Shutdown complete!")
 	w := worker.New(worker.Unlimited)
 	defer w.Close()
-	w.ErrorHandler = func(e error) {
+	w.SetErrorHandler(func(e error) {
 		log.Println(e)
 		if opErr, ok := e.(*net.OpError); ok {
 			if !opErr.Temporary() {
@@ -52,11 +52,11 @@ func main() {
 				}
 			}
 		}
-	}
-	w.JobHandler = func(job worker.Job) error {
+	})
+	w.SetJobHandler(func(job worker.Job) error {
 		log.Printf("Data=%s\n", job.Data())
 		return nil
-	}
+	})
 	w.AddServer("tcp4", "127.0.0.1:4730")
 	w.AddFunc("Foobar", Foobar, worker.Unlimited)
 	w.AddFunc("ToUpper", ToUpper, worker.Unlimited)

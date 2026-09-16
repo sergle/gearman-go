@@ -42,7 +42,7 @@ func TestCloseDoesNotPanicWithASendInFlight(t *testing.T) {
 
 	var collected closeErrors
 	w := New(Unlimited)
-	w.ErrorHandler = collected.add
+	w.SetErrorHandler(collected.add)
 
 	for i := 0; i < agents; i++ {
 		if err := w.AddServer(Network, s.Addr()); err != nil {
@@ -99,7 +99,7 @@ func TestCloseBeforeWorkClosesAgents(t *testing.T) {
 	s := newFakeWorkerServer(t)
 
 	w := New(Unlimited)
-	w.ErrorHandler = func(error) {}
+	w.SetErrorHandler(func(error) {})
 	if err := w.AddServer(Network, s.Addr()); err != nil {
 		t.Fatal(err)
 	}
@@ -141,16 +141,16 @@ func TestCloseBeforeWorkClosesAgents(t *testing.T) {
 // select's coin flip between two ready cases.
 func TestCloseDrainsAlreadyQueuedPackets(t *testing.T) {
 	w := New(Unlimited)
-	w.ErrorHandler = func(error) {}
+	w.SetErrorHandler(func(error) {})
 
 	var mu sync.Mutex
 	handled := 0
-	w.JobHandler = func(Job) error {
+	w.SetJobHandler(func(Job) error {
 		mu.Lock()
 		handled++
 		mu.Unlock()
 		return nil
-	}
+	})
 
 	// Without ready set, Work() calls Ready() and panics on ErrNoneAgents.
 	w.Lock()

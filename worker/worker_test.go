@@ -106,11 +106,11 @@ func TestWork(t *testing.T) {
 		t.Skip("To run this test, use: go test -integration")
 	}
 	var wg sync.WaitGroup
-	worker.JobHandler = func(job Job) error {
+	worker.SetJobHandler(func(job Job) error {
 		t.Logf("%s", job.Data())
 		wg.Done()
 		return nil
-	}
+	})
 	if err := worker.Ready(); err != nil {
 		t.Error(err)
 		return
@@ -148,11 +148,11 @@ func TestLargeDataWork(t *testing.T) {
 		t.Error(err)
 	}
 
-	worker.JobHandler = bigdataHandler
+	worker.SetJobHandler(bigdataHandler)
 
-	worker.ErrorHandler = func(err error) {
+	worker.SetErrorHandler(func(err error) {
 		t.Fatal("shouldn't have received an error")
-	}
+	})
 
 	if err := worker.Ready(); err != nil {
 		t.Error(err)
@@ -203,13 +203,13 @@ func TestWorkWithoutReady(t *testing.T) {
 	timeout := make(chan bool, 1)
 	done := make(chan bool, 1)
 
-	other_worker.JobHandler = func(j Job) error {
+	other_worker.SetJobHandler(func(j Job) error {
 		if !other_worker.isReady() {
 			t.Error("Worker not ready as expected")
 		}
 		done <- true
 		return nil
-	}
+	})
 	go func() {
 		time.Sleep(5 * time.Second)
 		timeout <- true

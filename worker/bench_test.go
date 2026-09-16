@@ -107,7 +107,7 @@ func BenchmarkWorkerJobPipelineOneByOne(b *testing.B) {
 	s.SetRecord(false)
 
 	w := New(OneByOne)
-	w.ErrorHandler = func(error) {}
+	w.SetErrorHandler(func(error) {})
 	if err := w.AddServer(Network, s.Addr()); err != nil {
 		b.Fatal(err)
 	}

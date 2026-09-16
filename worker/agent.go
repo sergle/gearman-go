@@ -257,14 +257,22 @@ func (a *agent) PreSleep() {
 	a.write(outpack)
 }
 
+// reconnect dials a fresh connection, publishes it, and re-announces this
+// worker's functions on it before resuming grabs.
+//
+// It never holds a.Mutex across the whole sequence, on purpose: publish
+// first, through setConn/connMu, then build the registration packets, then
+// write each one through the locked Write/Grab wrappers, each taking and
+// releasing a.Mutex on its own. a.Mutex and worker.Mutex are therefore never
+// nested in either order -- AddFunc/RemoveFunc hold worker.Mutex and reach
+// Write, which is the only order left in the package.
+//
+// Publishing before building the snapshot is what closes the registration
+// gap: an AddFunc landing anywhere in this sequence now writes its own CAN_DO
+// through the locked Write wrapper onto the same connection reconnect just
+// published, so it lands either in funcOutpacks' snapshot or as its own
+// write -- never neither. A duplicate CAN_DO is harmless.
 func (a *agent) reconnect() error {
-	// Built before a.Mutex is taken: this used to be a call into the worker
-	// from inside the critical section, taking a.Mutex then worker.Mutex while
-	// AddFunc/RemoveFunc/Close take them the other way round.
-	outpacks := a.worker.funcOutpacks()
-
-	a.Lock()
-	defer a.Unlock()
 	conn, err := net.Dial(a.net, a.addr)
 	if err != nil {
 		return err
@@ -272,11 +280,15 @@ func (a *agent) reconnect() error {
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	epoch := a.setConn(conn, rw)
 
+	// Publish before registering: an AddFunc landing in between then
+	// announces itself to this connection instead of the dead one.
+	outpacks := a.worker.funcOutpacks()
+
 	// Abilities before the grab, as on a fresh connection.
 	for _, outpack := range outpacks {
-		a.write(outpack)
+		a.Write(outpack)
 	}
-	a.grab()
+	a.Grab()
 
 	go a.work(epoch, rw)
 	return nil

@@ -437,7 +437,7 @@ func (s *fakeWorkerServer) AcceptedConns() int {
 func newTestWorker(t testing.TB, s *fakeWorkerServer, fn string, f JobFunc) *Worker {
 	t.Helper()
 	w := New(Unlimited)
-	w.ErrorHandler = func(error) {} // the teardown disconnect is expected
+	w.SetErrorHandler(func(error) {}) // the teardown disconnect is expected
 	if err := w.AddServer(Network, s.Addr()); err != nil {
 		t.Fatal(err)
 	}

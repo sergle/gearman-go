@@ -27,7 +27,7 @@ func ExampleWorker() {
 	}
 	var wg sync.WaitGroup
 	// A custome handler, for handling other results, eg. ECHO, dtError.
-	w.JobHandler = func(job worker.Job) error {
+	w.SetJobHandler(func(job worker.Job) error {
 		if job.Err() == nil {
 			fmt.Println(string(job.Data()))
 		} else {
@@ -35,12 +35,12 @@ func ExampleWorker() {
 		}
 		wg.Done()
 		return nil
-	}
+	})
 	// An error handler for handling worker's internal errors.
-	w.ErrorHandler = func(e error) {
+	w.SetErrorHandler(func(e error) {
 		fmt.Println(e)
 		// Ignore the error or shutdown the worker
-	}
+	})
 	// Tell Gearman job server: I'm ready!
 	if err := w.Ready(); err != nil {
 		fmt.Println(err)

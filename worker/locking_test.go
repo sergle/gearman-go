@@ -102,3 +102,76 @@ func TestReconnectDoesNotDeadlockAgainstAddFunc(t *testing.T) {
 
 	w.Close()
 }
+
+// reconnect used to build its registration snapshot before publishing the new
+// connection, so an AddFunc landing in between reached only the dead one.
+//
+// A goroutine race does not reproduce that -- the two statements were
+// adjacent, and a 200-round racing version of this test passed against the
+// unfixed code. So the ordering is forced instead: this holds worker.Mutex,
+// standing in for AddFunc's own critical section, and requires the reconnect
+// to dial and publish anyway. Pre-fix its first call is funcOutpacks(), which
+// blocks on that lock, so it never dials at all.
+func TestAddFuncDuringReconnectReachesTheLiveConnection(t *testing.T) {
+	srv := newFakeWorkerServer(t)
+	w := New(Unlimited)
+	w.Lock()
+	w.running = true
+	w.Unlock()
+
+	a, err := lockOrderAgent(w, srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Lock()
+	w.agents = []*agent{a}
+	w.Unlock()
+	a.conn.Close()
+
+	const name = "addfunc-during-reconnect"
+
+	callWithin(t, 5*time.Second, "reconnect racing a lock-holding AddFunc", func() {
+		// Held across the whole add-and-broadcast, as AddFunc holds it.
+		w.Lock()
+		defer w.Unlock()
+
+		go a.reconnect()
+
+		// The fixed reconnect publishes before it needs worker.Mutex, so the
+		// second connection appears while this goroutine still holds the lock.
+		deadline := time.Now().Add(2 * time.Second)
+		for srv.AcceptedConns() < 2 {
+			if time.Now().After(deadline) {
+				t.Errorf("reconnect never dialed while worker.Mutex was held -- " +
+					"it must publish the new connection before calling funcOutpacks")
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		// What AddFunc does under the same lock. The new connection is
+		// already published, so a.Write lands on it rather than the dead one.
+		w.funcs[name] = &jobFunc{f: func(job Job) ([]byte, error) { return nil, nil }}
+		a.Write(prepFuncOutpack(name, 0))
+	})
+
+	found := false
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, ab := range srv.Abilities() {
+			if ab == name {
+				found = true
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !found {
+		t.Errorf("%q, added under worker.Mutex during a reconnect, never reached the job server", name)
+	}
+
+	a.Close()
+	w.Close()
+}

@@ -30,6 +30,11 @@ exported field that could not be assigned without racing the client's own read
 of it; it is gone, replaced by the option and setter shown below. Worker
 exceptions also arrive differently — see *Upgrading*.
 
+**Neither is the worker API.** `Worker.ErrorHandler` and `Worker.JobHandler`
+had the same problem — plain fields read from every agent's connection
+goroutine — and are gone the same way, replaced by `SetErrorHandler` and
+`SetJobHandler`, shown below.
+
 Install
 =======
 
@@ -50,12 +55,14 @@ Usage
 ## Worker
 
 ```go
-// Limit number of concurrent jobs execution. 
+// Limit how many jobs are dispatched at once (not how many run: a job
+// function that misses its AddFunc timeout keeps running after the worker
+// gives up on it, so actual concurrency can exceed this).
 // Use worker.Unlimited (0) if you want no limitation.
 w := worker.New(worker.OneByOne)
-w.ErrHandler = func(e error) {
+w.SetErrorHandler(func(e error) {
 	log.Println(e)
-}
+})
 w.AddServer("127.0.0.1:4730")
 // Use worker.Unlimited (0) if you want no timeout
 w.AddFunc("ToUpper", ToUpper, worker.Unlimited)

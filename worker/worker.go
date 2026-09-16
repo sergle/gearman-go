@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,9 +30,11 @@ type Worker struct {
 	// writer, guarded by closed above.
 	quit chan struct{}
 
-	Id           string
-	ErrorHandler ErrorHandler
-	JobHandler   JobHandler
+	Id string
+	// Atomic, not exported fields: every agent's work() goroutine reads these,
+	// so assigning one after Ready() raced the goroutines already running.
+	errorHandler atomic.Pointer[ErrorHandler]
+	jobHandler   atomic.Pointer[JobHandler]
 	limit        chan bool
 }
 
@@ -42,6 +45,9 @@ type Worker struct {
 // If limit is greater than zero, the number of paralled executing
 // jobs are limited under the number. If limit is assgined to
 // OneByOne(=1), there will be only one job executed in a time.
+//
+// limit bounds dispatch, not execution: a job function that misses AddFunc's
+// timeout keeps running, so more than limit can be in flight at once.
 func New(limit int) (worker *Worker) {
 	worker = &Worker{
 		agents: make([]*agent, 0, limit),
@@ -55,10 +61,31 @@ func New(limit int) (worker *Worker) {
 	return
 }
 
+// SetErrorHandler installs or replaces the handler for the worker's internal
+// errors. Safe while the worker runs; nil disables it.
+func (worker *Worker) SetErrorHandler(h ErrorHandler) {
+	if h == nil {
+		worker.errorHandler.Store(nil)
+		return
+	}
+	worker.errorHandler.Store(&h)
+}
+
+// SetJobHandler installs or replaces the handler for results that are not a
+// job dispatch -- ECHO_RES, dtError. Safe while the worker runs; nil disables
+// it.
+func (worker *Worker) SetJobHandler(h JobHandler) {
+	if h == nil {
+		worker.jobHandler.Store(nil)
+		return
+	}
+	worker.jobHandler.Store(&h)
+}
+
 // inner error handling
 func (worker *Worker) err(e error) {
-	if worker.ErrorHandler != nil {
-		worker.ErrorHandler(e)
+	if h := worker.errorHandler.Load(); h != nil {
+		(*h)(e)
 	}
 }
 
@@ -84,6 +111,9 @@ func (worker *Worker) broadcast(outpack *outPack) {
 
 // AddFunc adds a function.
 // Set timeout as Unlimited(=0) to disable executing timeout.
+//
+// Past the timeout the job is reported failed and ErrTimeOut reaches the
+// error handler, but f itself keeps running: it is given up on, not stopped.
 func (worker *Worker) AddFunc(funcname string, f JobFunc, timeout uint32) (err error) {
 	worker.Lock()
 	defer worker.Unlock()
@@ -254,8 +284,8 @@ func (worker *Worker) Work() {
 
 // custome handling warper
 func (worker *Worker) customeHandler(inpack *inPack) {
-	if worker.JobHandler != nil {
-		if err := worker.JobHandler(inpack); err != nil {
+	if h := worker.jobHandler.Load(); h != nil {
+		if err := (*h)(inpack); err != nil {
 			worker.err(err)
 		}
 	}

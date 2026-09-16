@@ -34,7 +34,7 @@ func discardAgent(t *testing.T, w *Worker) *agent {
 
 func TestExecDoesNotRaceAddFuncRemoveFuncReset(t *testing.T) {
 	w := New(Unlimited)
-	w.ErrorHandler = func(error) {} // "function does not exist", expected while Reset/RemoveFunc churn
+	w.SetErrorHandler(func(error) {}) // "function does not exist", expected while Reset/RemoveFunc churn
 
 	bench := func(job Job) ([]byte, error) { return nil, nil }
 	if err := w.AddFunc("bench", bench, 0); err != nil {

@@ -255,7 +255,7 @@ func BenchmarkWorkerGetInPack(b *testing.B) {
 // result path (worker.go:285) and the benchmark prices a map lookup.
 func perfExecWorker(timeout uint32, f JobFunc) (*Worker, *inPack) {
 	w := New(Unlimited)
-	w.ErrorHandler = func(error) {}
+	w.SetErrorHandler(func(error) {})
 	w.funcs[perfFn] = &jobFunc{f: f, timeout: timeout}
 	w.running = true
 	a := perfWriteAgent()

@@ -324,7 +324,7 @@ func TestAgentWorkTruncatedPacketDisconnects(t *testing.T) {
 
 	w := New(Unlimited)
 	errs := make(chan error, 8)
-	w.ErrorHandler = func(e error) { errs <- e }
+	w.SetErrorHandler(func(e error) { errs <- e })
 
 	a := &agent{
 		conn:   local,

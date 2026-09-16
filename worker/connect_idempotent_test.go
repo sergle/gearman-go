@@ -24,7 +24,7 @@ func TestReadyTwiceDoesNotDuplicateConnection(t *testing.T) {
 	s.SetJob("bench", []byte("payload"))
 
 	w := New(Unlimited)
-	w.ErrorHandler = func(error) {}
+	w.SetErrorHandler(func(error) {})
 	if err := w.AddServer(Network, s.Addr()); err != nil {
 		t.Fatal(err)
 	}

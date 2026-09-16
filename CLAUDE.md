@@ -420,11 +420,27 @@ framed from four payload bytes for the rest of the connection. The worker
 silently stopped grabbing. `worker/framing_test.go` guards it.
 
 Reconnect is caller-driven: a dropped connection surfaces as
-`*WorkerDisconnectError` passed to `ErrorHandler`, and the handler calls
-`.Reconnect()` on it. `reconnect` builds the registration packets
-(`funcOutpacks`) before taking `agent.Mutex`, publishes the new conn/rw pair
-via `setConn` under it, writes them, and starts a fresh `work()` goroutine with
-the epoch `setConn` returned.
+`*WorkerDisconnectError` passed to the error handler, and the handler calls
+`.Reconnect()` on it. `reconnect` dials and publishes the new conn/rw pair via
+`setConn` first, *then* builds the registration packets (`funcOutpacks`),
+writes them through the locked `Write`/`Grab` wrappers, and starts a fresh
+`work()` goroutine with the epoch `setConn` returned. It does not hold
+`agent.Mutex` across any of this — each `Write`/`Grab` call takes and releases
+it on its own, so `agent.Mutex` and `worker.Mutex` are never nested in either
+order.
+
+Publishing before building the snapshot is what closes a registration gap
+that used to exist here: with the snapshot built first, an `AddFunc` landing
+between it and the publish wrote its `CAN_DO` to the connection being
+replaced and was missing from the new one's snapshot. Publishing first means
+a concurrent `AddFunc` now writes onto the same connection `reconnect` just
+published, so the function reaches it either way — in the snapshot or as its
+own write. Two concurrent `reconnect()` calls for one agent are not
+serialised against each other any more (nothing calls that from two
+goroutines for the same agent today, since a `work()` loop reports at most
+one `*WorkerDisconnectError` before it exits); if that ever changes, the
+loser's dialed connection leaks — `setConn` overwrites without closing it —
+and its `work()` goroutine simply exits on its next epoch check.
 
 `Worker.ready` is folded into the embedded `worker.Mutex`, read through the
 unexported `isReady()` rather than the field directly — `Work()`'s own

@@ -31,7 +31,7 @@ func callWithin(t *testing.T, d time.Duration, what string, fn func()) {
 func TestDisconnectErrorHandlerCanReconnect(t *testing.T) {
 	w := New(Unlimited)
 	a := discardAgent(t, w)
-	w.ErrorHandler = func(err error) {
+	w.SetErrorHandler(func(err error) {
 		de, ok := err.(*WorkerDisconnectError)
 		if !ok {
 			t.Errorf("handler got %T, want *WorkerDisconnectError", err)
@@ -40,7 +40,7 @@ func TestDisconnectErrorHandlerCanReconnect(t *testing.T) {
 		// The dial fails immediately (no net/addr set); only whether this
 		// call returns at all is under test.
 		de.Reconnect()
-	}
+	})
 
 	callWithin(t, 2*time.Second, "disconnect_error with a Reconnect handler", func() {
 		a.disconnect_error(errors.New("connection lost"))
@@ -57,9 +57,9 @@ func TestDisconnectErrorHandlerCanClose(t *testing.T) {
 	w.agents = []*agent{a}
 	w.running = true
 	w.Unlock()
-	w.ErrorHandler = func(err error) {
+	w.SetErrorHandler(func(err error) {
 		w.Close()
-	}
+	})
 
 	callWithin(t, 2*time.Second, "disconnect_error with a Close handler", func() {
 		a.disconnect_error(errors.New("connection lost"))

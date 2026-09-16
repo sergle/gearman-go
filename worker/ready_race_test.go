@@ -15,7 +15,7 @@ import (
 func TestReadyFlagDoesNotRaceWork(t *testing.T) {
 	s := newFakeWorkerServer(t)
 	w := New(Unlimited)
-	w.ErrorHandler = func(error) {}
+	w.SetErrorHandler(func(error) {})
 	if err := w.AddServer(Network, s.Addr()); err != nil {
 		t.Fatal(err)
 	}

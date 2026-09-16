@@ -53,7 +53,7 @@ func badMagicServer(t *testing.T) string {
 func TestWorkRedialRacesConcurrentWrite(t *testing.T) {
 	addr := badMagicServer(t)
 	w := New(Unlimited)
-	w.ErrorHandler = func(error) {} // the bad-magic errors are expected noise
+	w.SetErrorHandler(func(error) {}) // the bad-magic errors are expected noise
 
 	a, err := newAgent(Network, addr, w)
 	if err != nil {
