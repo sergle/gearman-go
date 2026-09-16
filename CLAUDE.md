@@ -336,26 +336,71 @@ not a connection pool to one server.
 ### Worker
 
 `Worker` owns one `agent` per job server. `AddServer` only constructs the
-agent; the dial happens in `Ready()`. Each connected agent runs its own `work()`
-goroutine and fans decoded packets into the single `worker.in` channel, which
-`Work()` drains in a blocking loop — so `Work()` is the only place job dispatch
-happens, and it must run in its own goroutine.
+agent; the dial happens in `Ready()`, and `Connect` is idempotent — an agent
+that already has a connection returns immediately rather than dialing again.
+That matters because `Ready()` is safe to retry: a partial failure on one
+agent, or `Work()`'s own auto-`Ready()` after an explicit one that errored,
+must not tear down agents that already connected and may have jobs grabbed on
+them. Each connected agent runs its own `work()` goroutine and fans decoded
+packets into the single `worker.in` channel, which `Work()` drains in a
+blocking loop — so `Work()` is the only place job dispatch happens, and it
+must run in its own goroutine.
+
+`agent.conn`/`agent.rw` are guarded by `connMu`, a dedicated `sync.RWMutex` —
+the worker-side analogue of the client's `connMu` — published together via
+`setConn` so no observer ever sees an `rw` that belongs to a different `conn`.
+Deliberately not the embedded `agent.Mutex`: `work()` cannot take that one
+without stalling every writer it serves (`Grab`, `PreSleep`, `SendData`, ...
+all hold it for a whole round trip). `write()` takes a single `rw` snapshot via
+`getRW` and does its I/O on the local, exactly like `client.write`; `connMu` is
+never held across that I/O. `read()` does **not** call `getRW` — it takes the
+`rw` as a parameter, because a snapshot taken per call is one read too late:
+a stale `work()` loop calling `read()` again after a newer `setConn` would
+snapshot the *new* `rw` and read it alongside the loop that owns it, two
+readers on one `bufio.Reader`, which is §10's desync class. `work()` carries
+the `rw` it was started with as a local and re-points it only when it redials
+itself. Lock
+order: a caller already holding `agent.Mutex` may then take `connMu` to
+snapshot or publish the pair — `Connect`, `reconnect` and `write` all do
+exactly that — and nothing may take `connMu` and then try to take
+`agent.Mutex`. `Close` and `disconnect_error` read/clear `conn` through the
+same lock, snapshotting and releasing before `disconnect_error` calls
+`worker.err` with no lock held. `Close` leaves `rw` alone on purpose: a write
+against it after `Close` hits a dead socket and returns an ordinary error,
+same as before this lock existed — nilling it would make `write()` dereference
+a nil `*bufio.ReadWriter` instead.
+
+`setConn` also bumps a per-agent `epoch`. Every `go a.work(epoch, rw)` call site
+captures the epoch its connection was published under and `work()` rechecks it
+immediately after every `read()`, before any error routing: a stale loop —
+one superseded by a newer `Connect`/`reconnect` while it was still blocked
+reading its own, now-abandoned connection — exits instead of falling through
+to `disconnect_error` or the redial branch against a connection some other
+goroutine now owns. With `rw` passed in rather than re-fetched, that is *all*
+the epoch does: cross-connection reads are ruled out structurally, and the
+check only stops the superseded loop from acting on someone else's
+connection. This is what makes `Connect`'s idempotency guard safe
+against every path, not just the retried-`Ready()` one it targets directly.
 
 Concurrency is capped by the `limit` buffered channel: `New(OneByOne)` gives
 capacity 0, `New(Unlimited)` leaves it nil (uncapped). A token is pushed in
 `handleInPack` and popped in `exec`'s defer.
 
-Unlike the client, `agent.read` (`worker/agent.go:179`) frames each packet
-itself rather than re-parsing a buffer: `io.ReadFull` for the 12-byte header,
-then `io.ReadFull` of exactly the body length the header declares. It returns
-one whole packet or an error with `nil` data — never a fragment, never bytes
-belonging to the next packet — so `work()` has no `leftdata` tail to carry
-between iterations and must not grow one. It also rejects a body over
-`maxPacketLength` (64 MiB, `worker/common.go`) and a header whose magic is not
-`\x00RES`; both are how a desynced stream fails fast now that the body is
-pre-allocated from the declared length. Those go through `work()`'s generic
-branch — report, `Close`, redial, `continue` — because a desynced stream cannot
-be resynchronised in place.
+Unlike the client, `agent.read` frames each packet itself rather than
+re-parsing a buffer: `io.ReadFull` for the 12-byte header, then `io.ReadFull`
+of exactly the body length the header declares. It returns one whole packet or
+an error with `nil` data — never a fragment, never bytes belonging to the next
+packet — so `work()` has no `leftdata` tail to carry between iterations and
+must not grow one. It also rejects a body over `maxPacketLength` (64 MiB,
+`worker/common.go`) and a header whose magic is not `\x00RES`; both are how a
+desynced stream fails fast now that the body is pre-allocated from the
+declared length. Those go through `work()`'s generic branch — report, dial the
+replacement, publish it via `setConn` (re-capturing `epoch` for this same,
+continuing loop), close the old connection, `continue` — because a desynced
+stream cannot be resynchronised in place. The old connection is closed *after*
+the new pair is published, not before: closing first would leave a window
+where `getConn()` reports nil, which a concurrent `Connect()` would read as
+"not connected" and dial its own second connection.
 
 `io.EOF` and `io.ErrUnexpectedEOF` must **not**: `work()` routes both to
 `disconnect_error`, and the distinction matters because the generic branch
@@ -376,8 +421,15 @@ silently stopped grabbing. `worker/framing_test.go` guards it.
 
 Reconnect is caller-driven: a dropped connection surfaces as
 `*WorkerDisconnectError` passed to `ErrorHandler`, and the handler calls
-`.Reconnect()` on it. `reconnect` re-registers all functions
-(`funcOutpacks`) and starts a fresh `work()` goroutine.
+`.Reconnect()` on it. `reconnect` builds the registration packets
+(`funcOutpacks`) before taking `agent.Mutex`, publishes the new conn/rw pair
+via `setConn` under it, writes them, and starts a fresh `work()` goroutine with
+the epoch `setConn` returned.
+
+`Worker.ready` is folded into the embedded `worker.Mutex`, read through the
+unexported `isReady()` rather than the field directly — `Work()`'s own
+auto-`Ready()` check goes through it, and so must anything else that reads it
+from a different goroutine than the one that called `Ready()`.
 
 ## Conventions
 

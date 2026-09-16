@@ -48,7 +48,7 @@ func readWithin(t *testing.T, a *agent) readResult {
 	t.Helper()
 	done := make(chan readResult, 1)
 	go func() {
-		data, err := a.read()
+		data, err := a.read(a.getRW())
 		done <- readResult{data, err}
 	}()
 	select {
@@ -335,7 +335,9 @@ func TestAgentWorkTruncatedPacketDisconnects(t *testing.T) {
 		// error and names itself in the failure rather than hanging.
 		addr: "127.0.0.1:1",
 	}
-	go a.work()
+	// Fields set directly above, bypassing setConn, so the epoch is its zero
+	// value; read it back rather than assume that, in case it ever changes.
+	go a.work(a.currentEpoch(), a.rw)
 
 	pkt := resPacket(dtJobAssignUniq,
 		jobAssignBody(fakeJobHandle, "bench", fakeJobUniq, []byte("cut short")))

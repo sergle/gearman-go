@@ -15,8 +15,9 @@ import (
 // each, so this fails on a deadline rather than hanging the binary.
 //
 // A fresh agent per round, dialed here rather than through Connect: Connect
-// starts a work() goroutine that reads a.rw unlocked, so reconnecting
-// underneath it reports that separate, still open defect instead of this one.
+// starts a work() goroutine that would consume the connection out from under
+// this test's own direct a.reconnect() calls, reporting a grab/read race
+// unrelated to the lock order under test here.
 
 // lockOrderAgent returns an agent connected to srv, with no read loop running.
 // It reports errors rather than failing the test: its callers run off the test

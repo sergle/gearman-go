@@ -61,7 +61,7 @@ func TestCloseDuringReadLoopIsRaceFree(t *testing.T) {
 	wg.Wait()
 }
 
-// TestCloseDuringRedialDoesNotReconnect covers §7's second route into the
+// TestCloseDuringRedialDoesNotReconnect covers the second route into the
 // resurrection: readLoop can take a genuine transport error, call closeConn,
 // and be about to redial while Close() lands concurrently -- no nil rw is
 // ever observed on this path, unlike the route TestCloseIsIdempotentAndSubsequentCallsFail

@@ -182,8 +182,11 @@ func BenchmarkWorkerAgentRead(b *testing.B) {
 			a := perfReadAgent(c.pkt)
 			b.ReportAllocs()
 			b.ResetTimer()
+			// a.rw directly, not getRW(): work() now passes read() the rw it
+			// was started with rather than re-fetching it under connMu every
+			// call, so a field read is what the real call site costs.
 			for i := 0; i < b.N; i++ {
-				perfSinkBytes, perfSinkErr = a.read()
+				perfSinkBytes, perfSinkErr = a.read(a.rw)
 			}
 		})
 	}
@@ -486,7 +489,7 @@ func TestWorkerPerfFixtures(t *testing.T) {
 		pkt := perfResPacket(dtJobAssignUniq, perfAssignBody(true, perfSmallPayload))
 		a := perfReadAgent(pkt)
 		for i := 0; i < 3; i++ {
-			got, err := a.read()
+			got, err := a.read(a.rw)
 			if err != nil {
 				t.Fatal(err)
 			}

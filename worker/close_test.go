@@ -128,10 +128,9 @@ func TestCloseBeforeWorkClosesAgents(t *testing.T) {
 	agents := append([]*agent(nil), w.agents...)
 	w.Unlock()
 	for i, a := range agents {
-		a.Lock()
-		conn := a.conn
-		a.Unlock()
-		if conn != nil {
+		// a.Mutex no longer guards conn; it moved to connMu with the rest of
+		// the conn/rw pair.
+		if conn := a.getConn(); conn != nil {
 			t.Errorf("agent %d: conn still open after Close before Work", i)
 		}
 	}

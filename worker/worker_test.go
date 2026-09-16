@@ -204,7 +204,7 @@ func TestWorkWithoutReady(t *testing.T) {
 	done := make(chan bool, 1)
 
 	other_worker.JobHandler = func(j Job) error {
-		if !other_worker.ready {
+		if !other_worker.isReady() {
 			t.Error("Worker not ready as expected")
 		}
 		done <- true
@@ -224,7 +224,7 @@ func TestWorkWithoutReady(t *testing.T) {
 	go func() {
 		tries := 5
 		for tries > 0 {
-			if other_worker.ready {
+			if other_worker.isReady() {
 				other_worker.Echo([]byte("Hello"))
 				break
 			}

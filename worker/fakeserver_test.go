@@ -406,6 +406,18 @@ func (s *fakeWorkerServer) Counts() (assigned, completed int) {
 	return s.assigned, s.completed
 }
 
+// AcceptedConns is the number of connections accepted so far. s.conns is only
+// ever appended to, never pruned, so this is a cumulative dial count rather
+// than a live-connection count -- exactly what catches a duplicate dial: one
+// agent that
+// dialed twice reports 2 here even though one of the two sockets is long
+// since abandoned.
+func (s *fakeWorkerServer) AcceptedConns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.conns)
+}
+
 // --- harness self-tests ----------------------------------------------------
 //
 // These prove the fake server actually speaks the protocol. Without them the

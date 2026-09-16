@@ -197,14 +197,27 @@ func (worker *Worker) Ready() (err error) {
 	for funcname, f := range funcs {
 		worker.addFunc(funcname, f.timeout)
 	}
+	worker.Lock()
 	worker.ready = true
+	worker.Unlock()
 	return
+}
+
+// isReady reports whether Ready has completed. Folded into worker.Mutex
+// rather than made atomic, matching running and closed, its neighbours in the
+// same struct; no path below takes worker.Mutex and then calls into an agent
+// -- that lock order is inverted against agent.reconnect and deadlocks -- so
+// isReady is safe to call from anywhere.
+func (worker *Worker) isReady() bool {
+	worker.Lock()
+	defer worker.Unlock()
+	return worker.ready
 }
 
 // Work start main loop (blocking)
 // Most of time, this should be evaluated in goroutine.
 func (worker *Worker) Work() {
-	if !worker.ready {
+	if !worker.isReady() {
 		// didn't run Ready beforehand, so we'll have to do it:
 		err := worker.Ready()
 		if err != nil {
