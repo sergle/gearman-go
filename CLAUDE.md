@@ -246,20 +246,29 @@ concurrently. Both go through an internal `atomic.Pointer[ErrorHandler]`.
   is whole and length-checked, so it is a malformed body and the stream is still
   in sync. `readLoop` reports it and takes the next packet.
 
-  In the error path, a **permanent** `*net.OpError` breaks the loop rather than
-  redialing. That is the socket `Close()` just took; redialing there resurrects
-  a client the caller shut down. Everything else — `io.EOF`,
-  `io.ErrUnexpectedEOF`, a framing error, a temporary `OpError` — closes and
-  redials, because a half-read packet cannot be resumed mid-stream. A nil `rw`
-  reaches that redial as `ErrLostConn` too, but `readLoop` treats it as
-  terminal rather than redialable: `Client.closed`, set by `Close` and read
-  under `connMu`, is what tells the two apart from an ordinary transport
-  failure. `connect()` refuses to dial once it is set, and `setConn` refuses
-  to publish even a dial that was already in flight when `Close` landed —
-  checked in both places, since a check only before the dial would race it.
-  Both refusals report `ErrLostConn`, and `readLoop` breaks on it without
-  redialing or reporting to `ErrorHandler`, closing off both routes into the
-  resurrection §7 used to describe.
+  The loop condition itself tests `client.isClosed()`, not `getConn() != nil`:
+  `conn == nil` no longer implies `Close()` now that `do` and `Echo`
+  can null it out too (see below), and the old condition read a `closeConn`
+  from one of them, landing between two packets, as a shutdown — the loop
+  exited for good, no error, no redial, nothing left to ever read this
+  connection's replacement again.
+
+  In the error path, `readLoop` closes the connection — unless the error is
+  `ErrLostConn`, meaning it was already closed — and then breaks or redials by
+  the same direct test, `client.isClosed()`. That replaced an inference from
+  the error itself: a permanent `*net.OpError` used to be treated as proof
+  that `Close()` caused it, which stopped holding once `do` and
+  `Echo` started closing the connection on their own `ResponseTimeout` too
+  (see below) — a permanent `OpError` no longer implies `Close()`. The same
+  test covers the `ErrLostConn` case: `readPacket` found `rw` already nil,
+  which now has two causes, not one — `Close()`, or a timeout in
+  `do`/`Echo` racing this loop between packets — and only
+  `isClosed()` tells them apart; the timeout case redials exactly as any other
+  closed connection does. `connect()` refuses to dial once `closed` is set,
+  and `setConn` refuses to publish even a dial that was already in flight when
+  `Close` landed — checked in both places, since a check only before the dial
+  would race it. Both refusals report `ErrLostConn`, closing off both routes
+  into the resurrection §7 used to describe.
 - `processLoop` — drains `in` and dispatches by `DataType`.
 
 Responses are correlated by **position, not by request identity**, and
@@ -300,14 +309,39 @@ reply never arrives at all (not just late): each no-op absorbs the *next*
 caller's reply instead, that caller abandons its own entry the same way, and
 the debt just moves rather than draining. `abandon` stamps `ttl` (the
 client's `ResponseTimeout`) as the entry's deadline, and `take` drops a
-front entry past its deadline before correlating. This is a bound, not a full
-fix: nothing on the wire tells a late-but-real reply apart from the next
-request's own reply, so a caller retrying immediately after a timeout can
-still lose once to a stale entry, exactly as before -- `take` cannot tell them
-apart and must not, or the late-reply case above breaks. What it stops is the
-debt persisting forever: once a gap exceeds `ttl`, or the connection drops,
-the entry is gone. `closeConn` calls `reset` on both queues for the latter
-case -- nothing on a closed connection will ever answer what was queued on it.
+front entry past its deadline before correlating. `closeConn` calls `reset` on
+both queues when a connection drops -- nothing on a closed connection will
+ever answer what was queued on it.
+
+`do` and `Echo` now call `closeConn` themselves when their own
+`ResponseTimeout` fires, right after `abandon`. **`Status` deliberately does
+not**: `STATUS_RES` carries the job handle, so `statusHandlers` matches by key
+and `cancel` is enough — closing there would cost an unrelated in-flight `Do`
+its `WORK_COMPLETE` and buy nothing. That was the
+remaining gap: without it, a caller retrying immediately after a timeout, with
+no gap for `ttl` to pass, never recovered -- the debt above moved from caller
+to caller forever, because every retry's own reply arrived well inside the
+still-live abandoned entry's window. Closing the connection removes the
+ambiguity outright rather than bounding it: `reset` empties the queue in the
+same call, so nothing is left on the old connection to misdirect, and the
+redial starts every caller fresh. `abandon`'s `ttl` still guards the one case
+`closeConn` cannot reach here -- a concurrent, unrelated disconnect that beat
+this call's own `closeConn` to `reset`-ing the queue, leaving nothing for it to
+close -- and is otherwise superseded by the unconditional reset a few lines
+later in the same call.
+
+This does not touch `rhandlers`, `processLoop`'s own map of a foreground
+`Do`'s external handler keyed by job handle -- `closeConn` only resets
+`created` and `echo`. A `Do` that already got its `JOB_CREATED` and returned
+has nothing left in either queue for a later timeout to disturb; its callback
+is waiting purely on a `WORK_COMPLETE`/`WORK_FAIL`/`WORK_EXCEPTION` that may
+now never arrive, because a *different*, later call's timeout dropped the
+connection it was going to arrive on. The callback then never fires -- no
+error either, since nothing calls it -- and its `rhandlers` entry outlives the
+client. Not new: the same loss already happened on `readLoop`'s transport-error
+redial; closing on timeout widens how often it can happen rather than
+introducing it. It is also why `Status` does not close: polling a slow job
+would otherwise take that job's own result delivery down with it.
 
 `do`, `Status` and `Echo` each hold `client.Mutex` across the **entire** round
 trip — write, then block on the result channel until `processLoop` delivers or
@@ -341,24 +375,29 @@ The invariant this creates governs the whole file:
 Connection state therefore has its own lock, `connMu`, reached through
 `getConn` / `getRW` / `setConn` and held only around load/store, never across
 I/O. Do not reuse `client.Mutex` for it — that deadlocks. `Close` takes
-`connMu` only — once directly, to set `closed`, and again via `closeConn` — and
-`readLoop` closes through `closeConn` rather than `Close`, for the same
-reason: `client.Mutex` there would stall the re-dial for a whole
-`ResponseTimeout`, and the caller's response can only arrive over the
-connection being rebuilt.
+`connMu` only — once directly, to set `closed`, and again via `closeConn`.
+`readLoop`, and now `do`/`Echo` on their own `ResponseTimeout`, all
+close through `closeConn` rather than `Close` too, for the same reason:
+`client.Mutex` there would stall the re-dial for a whole `ResponseTimeout`,
+and the caller's response can only arrive over the connection being rebuilt --
+`do`/`Echo` already hold `client.Mutex` at that point, so this is the
+one `closeConn` call site that is *not* also avoiding a deadlock, just
+following the same rule for consistency.
 
 `readLoop` re-dials internally on error, so a connection the caller closed
 could come back: it closes, reconnects, loops, and the loop condition passes
-because it just reconnected. `Client.closed` (see above) is what stops that —
-`readLoop` never checks it directly; it stops via the `getConn() != nil` loop
-condition plus the two `ErrLostConn` breaks in its error path, both fed by
-`connect()`/`setConn()` refusing once `closed` is set. A residual, bounded
-window remains and is deliberate, not a resurrection: `connect()` can pass the
-`closed` check, dial, and write one `OPTION_REQ` before `setConn` refuses and
-closes that connection, so one accepted connection and one packet can still
-reach the job server after `Close` returns. The client never publishes or uses
-that connection — `getConn()` stays nil throughout — so no caller can reach it
-through `Do`, `Status` or `Echo`.
+because it just reconnected. `Client.closed` (see above) is what stops that,
+and `readLoop` now checks it directly — `client.isClosed()`, right after its
+own `closeConn` call in the error path — rather than inferring it from the
+error's shape. `connect()`/`setConn()` refuse once `closed` is set as a second,
+independent check, since `isClosed()` in the loop and the dial that follows it
+are not atomic. A residual, bounded window remains and is deliberate, not a
+resurrection: `connect()` can pass the `closed` check, dial, and write one
+`OPTION_REQ` before `setConn` refuses and closes that connection, so one
+accepted connection and one packet can still reach the job server after
+`Close` returns. The client never publishes or uses that connection —
+`getConn()` stays nil throughout — so no caller can reach it through `Do`,
+`Status` or `Echo`.
 
 `Pool` wraps N clients with a `SelectionHandler` for server selection. It is
 not a connection pool to one server.

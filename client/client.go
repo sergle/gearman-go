@@ -328,38 +328,34 @@ func (client *Client) readPacket(hdr []byte) (packet []byte, err error) {
 func (client *Client) readLoop() {
 	defer close(client.in)
 	var hdr [minPacketLength]byte
-	for client.getConn() != nil {
+
+	for !client.isClosed() {
 		packet, err := client.readPacket(hdr[:])
 		if err != nil {
-			if err == ErrLostConn {
-				// getRW observed a nil rw: Close() cleared it between the loop
-				// condition above and here, not a transport failure. Redialing
-				// is exactly the resurrection this guards against, and it is
-				// not worth reporting to ErrorHandler either -- it is the
-				// caller's own shutdown.
-				break
-			}
-			if opErr, ok := err.(*net.OpError); ok {
-				if opErr.Timeout() {
+			if err != ErrLostConn {
+				if opErr, ok := err.(*net.OpError); ok {
+					if opErr.Timeout() {
+						client.err(err)
+					}
+				} else {
 					client.err(err)
 				}
-				if !opErr.Temporary() {
-					// Permanent, which includes the socket Close() just took:
-					// redialing would resurrect a client the caller shut down.
-					break
-				}
-			} else {
-				client.err(err)
+				// A half-read packet cannot be resynchronised, so rebuild the
+				// connection rather than resume mid-stream. connect()
+				// re-negotiates the "exceptions" option, which the server
+				// holds per connection.
+				//
+				// closeConn, not Close: callers hold client.Mutex for a whole
+				// round trip, so taking it here would stall the re-dial until
+				// their ResponseTimeout fired -- and their response can only
+				// arrive over the connection this loop is rebuilding.
+				client.closeConn()
 			}
-			// A half-read packet cannot be resynchronised, so rebuild the
-			// connection rather than resume mid-stream. connect() re-negotiates
-			// the "exceptions" option, which the server holds per connection.
-			//
-			// closeConn, not Close: callers hold client.Mutex for a whole round
-			// trip, so taking it here would stall the re-dial until their
-			// ResponseTimeout fired -- and their response can only arrive over
-			// the connection this loop is rebuilding.
-			client.closeConn()
+			// A nil rw is Close, or a caller's timeout racing this loop.
+			// isClosed tells them apart; the shape of the error cannot.
+			if client.isClosed() {
+				break
+			}
 			if err = client.connect(); err != nil {
 				if err != ErrLostConn {
 					// ErrLostConn here means Close() landed while this loop
@@ -521,6 +517,9 @@ func (client *Client) do(funcname string, data []byte, flag uint32, h ResponseHa
 		return ret.handle, ret.err
 	case <-timeout:
 		client.handlers.created.abandon(token, client.ResponseTimeout)
+		// A late reply is indistinguishable from the next caller's own, so
+		// drop the connection: closeConn empties the queue, readLoop redials.
+		client.closeConn()
 		return "", ErrLostConn
 	}
 	return
@@ -578,6 +577,8 @@ func (client *Client) Status(handle string) (status *Status, err error) {
 		// asked, and reporting both ways fires the handler needlessly.
 		return ret.status, ret.err
 	case <-timeout:
+		// No closeConn, unlike do and Echo: STATUS_RES carries the handle, so
+		// cancel is enough, and closing would cost an in-flight Do its result.
 		client.handlers.status.cancel(handle)
 		return nil, ErrLostConn
 	}
@@ -607,6 +608,7 @@ func (client *Client) Echo(data []byte) (echo []byte, err error) {
 		return ret, nil
 	case <-timeout:
 		client.handlers.echo.abandon(token, client.ResponseTimeout)
+		client.closeConn() // see do: a late reply can no longer be trusted
 		return nil, ErrLostConn
 	}
 }

@@ -42,6 +42,42 @@ func TestEchoRecoversOnceTheAbandonedEntryExpires(t *testing.T) {
 	}
 }
 
+// The case neither mitigation above covers: retrying with no gap for the
+// abandoned entry to expire and nothing to drop the connection. Each retry's
+// reply used to be eaten by the previous entry, which left one of its own, so
+// the debt moved but never drained. Echo closes the connection now.
+func TestEchoRecoversFromARetryWithNoGap(t *testing.T) {
+	s := newFakeJobServer(t)
+	c := newTestClient(t, s)
+	c.SetErrorHandler(func(error) {})
+	c.ResponseTimeout = 150 * time.Millisecond
+
+	s.SetSilent(true)
+	if _, err := c.Echo([]byte("first")); err != ErrLostConn {
+		t.Fatalf("first Echo err = %v, want ErrLostConn", err)
+	}
+	s.SetSilent(false)
+
+	// Sleep between attempts: a retry during the redial fails instantly, and
+	// a tight loop starves readLoop's goroutine rather than measuring it.
+	deadline := time.Now().Add(3 * time.Second)
+	var got []byte
+	var err error
+	for time.Now().Before(deadline) {
+		got, err = c.Echo([]byte("retry"))
+		if err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("retry with no gap never recovered within 3s: %v", err)
+	}
+	if string(got) != "retry" {
+		t.Errorf("Echo = %q, want %q", got, "retry")
+	}
+}
+
 // TestEchoRecoversAfterATimedOutRequestAndADisconnect is the disconnect
 // variant: dropping the connection clears both handler queues outright
 // (closeConn), so a call issued after redial is never at risk from an entry

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -105,23 +106,26 @@ func TestHandlerSlotNeverEvictsALiveFrontEntry(t *testing.T) {
 
 // --- end-to-end regression, driven over a real socket -----------------------
 
-// lateEchoServer holds the first ECHO_REQ unanswered until a second arrives,
-// then answers the held one and the second right behind it: a reply landing
-// after its caller gave up, ahead of the next caller's own.
-func lateEchoServer(t *testing.T) string {
+// lateEchoServer holds the first connection's ECHO_REQ unanswered, then
+// flushes it past the client's ResponseTimeout -- onto a socket Echo's own
+// timeout has closed by then. Redialed connections answer immediately.
+func lateEchoServer(t *testing.T) (addr string, connCount func() int32) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
+	var accepted, first int32
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go func(conn net.Conn) {
+			atomic.AddInt32(&accepted, 1)
+			holds := atomic.CompareAndSwapInt32(&first, 0, 1)
+			go func(conn net.Conn, holds bool) {
 				defer conn.Close()
 				hdr := make([]byte, minPacketLength)
 				var held []byte
@@ -137,25 +141,33 @@ func lateEchoServer(t *testing.T) string {
 					switch {
 					case dt == dtOptionReq:
 						writePacket(conn, dtOptionRes, body)
-					case dt == dtEchoReq && held == nil:
-						held = append([]byte(nil), body...) // hold: no reply yet
+					case dt == dtEchoReq && holds && held == nil:
+						held = append([]byte(nil), body...)
+						go func() {
+							time.Sleep(300 * time.Millisecond)
+							writePacket(conn, dtEchoRes, held) // late; conn is dead by now
+						}()
 					case dt == dtEchoReq:
-						writePacket(conn, dtEchoRes, held) // the late reply, first
-						writePacket(conn, dtEchoRes, body) // this caller's own reply
+						writePacket(conn, dtEchoRes, body)
 					}
 				}
-			}(conn)
+			}(conn, holds)
 		}
 	}()
-	return ln.Addr().String()
+	return ln.Addr().String(), func() int32 { return atomic.LoadInt32(&accepted) }
 }
 
 // TestEchoLateReplyDoesNotSatisfyNextCaller: a first Echo times out against a
-// server that never answers it, a second Echo is then issued, and the first
-// caller's reply finally arrives just ahead of the second's own. The second
-// caller must get its own data back, not the first caller's.
+// server that never answers it in time, and a second Echo is then issued
+// after redial. It must get its own data back, never a reply meant for the
+// first, abandoned call.
+//
+// The two calls used to share a connection, where a late reply could land
+// ahead of the second caller's own and satisfy it. Timeouts drop the
+// connection now, so they are never on the wire together -- this guards that
+// construction, and would catch a redial that reused the old queue.
 func TestEchoLateReplyDoesNotSatisfyNextCaller(t *testing.T) {
-	addr := lateEchoServer(t)
+	addr, connCount := lateEchoServer(t)
 	c, err := New(Network, addr)
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +176,17 @@ func TestEchoLateReplyDoesNotSatisfyNextCaller(t *testing.T) {
 	c.ResponseTimeout = 100 * time.Millisecond
 
 	if _, err := c.Echo([]byte("first")); err != ErrLostConn {
-		t.Fatalf("first Echo err = %v, want ErrLostConn (server never answers it)", err)
+		t.Fatalf("first Echo err = %v, want ErrLostConn (server never answers it in time)", err)
+	}
+
+	// The timeout above closed that connection; wait for readLoop's redial to
+	// finish its handshake on a fresh one before issuing the next call.
+	deadline := time.Now().Add(2 * time.Second)
+	for connCount() < 2 || !c.ExceptionsEnabled() {
+		if time.Now().After(deadline) {
+			t.Fatal("no re-dial within 2s")
+		}
+		time.Sleep(time.Millisecond)
 	}
 
 	c.ResponseTimeout = 2 * time.Second
@@ -173,7 +195,7 @@ func TestEchoLateReplyDoesNotSatisfyNextCaller(t *testing.T) {
 		t.Fatalf("second Echo: %v", err)
 	}
 	if string(got) != "second" {
-		t.Errorf("second Echo = %q, want %q -- the first caller's late reply satisfied it instead",
+		t.Errorf("second Echo = %q, want %q -- a reply meant for the first, abandoned call leaked into it",
 			got, "second")
 	}
 }

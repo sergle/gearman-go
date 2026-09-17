@@ -110,3 +110,45 @@ func TestCloseDuringRedialDoesNotReconnect(t *testing.T) {
 		}
 	}
 }
+
+// The loop condition's own window, distinct from the read-error paths above:
+// a timeout's closeConn can null out conn while readLoop is between packets,
+// which getConn() != nil read as shutdown -- no error, no redial, the client
+// silently stopped reading for good.
+//
+// Driven blind like the test above: closeConn in a tight loop against a
+// server answering immediately, so many calls land in that window.
+func TestReadLoopSurvivesACloseConnRacingBetweenPackets(t *testing.T) {
+	s := newFakeJobServer(t)
+	c := newTestClient(t, s)
+	c.SetErrorHandler(func(error) {})
+	c.ResponseTimeout = 200 * time.Millisecond
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				c.closeConn()
+			}
+		}
+	}()
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	<-done
+
+	// Bounded retry, not one call: the last closeConn may not have settled
+	// into a redial yet. The point is that it recovers at all.
+	deadline := time.Now().Add(2 * time.Second)
+	var err error
+	for time.Now().Before(deadline) {
+		if _, err = c.Echo([]byte("x")); err == nil {
+			return
+		}
+	}
+	t.Fatalf("readLoop did not recover from closeConn racing it between packets: %v", err)
+}
