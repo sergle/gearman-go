@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -58,7 +59,6 @@ func SelectRandom(pool map[string]*PoolClient, last string) (addr string) {
 
 type Pool struct {
 	SelectionHandler SelectionHandler
-	ErrorHandler     ErrorHandler
 	Clients          map[string]*PoolClient
 
 	last string
@@ -67,6 +67,10 @@ type Pool struct {
 	// a call into a Client: that would stall every other caller for a whole
 	// round trip.
 	mutex sync.RWMutex
+
+	// errorHandler is what SetErrorHandler installs. Atomic because Add reads
+	// it on its caller's goroutine, concurrently with SetErrorHandler.
+	errorHandler atomic.Pointer[ErrorHandler]
 }
 
 // NewPool returns a new pool.
@@ -74,6 +78,31 @@ func NewPool() (pool *Pool) {
 	return &Pool{
 		Clients:          make(map[string]*PoolClient, poolSize),
 		SelectionHandler: SelectWithRate,
+	}
+}
+
+// SetErrorHandler installs the handler on every pooled client -- outside
+// pool.mutex, which is never held across a call into a Client -- and keeps it
+// for the ones Add builds later. nil disables it.
+//
+// A call racing an in-flight Add can miss that one client: Add reads the
+// handler before it re-locks to insert. The next Add or SetErrorHandler
+// reaches it.
+func (pool *Pool) SetErrorHandler(h ErrorHandler) {
+	if h == nil {
+		pool.errorHandler.Store(nil)
+	} else {
+		pool.errorHandler.Store(&h)
+	}
+
+	pool.mutex.RLock()
+	clients := make([]*PoolClient, 0, len(pool.Clients))
+	for _, c := range pool.Clients {
+		clients = append(clients, c)
+	}
+	pool.mutex.RUnlock()
+	for _, c := range clients {
+		c.SetErrorHandler(h)
 	}
 }
 
@@ -99,6 +128,9 @@ func (pool *Pool) Add(net, addr string, rate int) (err error) {
 	if client, err = New(net, addr); err != nil {
 		return
 	}
+	if h := pool.errorHandler.Load(); h != nil {
+		client.SetErrorHandler(*h)
+	}
 
 	pool.mutex.Lock()
 	defer pool.mutex.Unlock()
@@ -111,11 +143,17 @@ func (pool *Pool) Add(net, addr string, rate int) (err error) {
 	return
 }
 
-// Remove a server.
+// Remove a server, closing its client. Closed after the unlock, as Add closes
+// its loser: the lock is never held across a call into a Client. The error is
+// dropped, as Add drops its own.
 func (pool *Pool) Remove(addr string) {
 	pool.mutex.Lock()
-	defer pool.mutex.Unlock()
+	item, ok := pool.Clients[addr]
 	delete(pool.Clients, addr)
+	pool.mutex.Unlock()
+	if ok {
+		item.Close()
+	}
 }
 
 // Do submits a job. It deliberately does not lock the client: (*Client).do

@@ -79,8 +79,8 @@ type Client struct {
 
 	// timer backs that wait. One timer serves all three methods because each
 	// holds client.Mutex from its write until the reply, so at most one wait is
-	// ever in flight -- the same invariant that makes the fixed handler slots
-	// work. A fresh time.NewTimer costs three allocations a call.
+	// ever in flight -- the same invariant handlerSlot's queue relies on. A
+	// fresh time.NewTimer costs three allocations a call.
 	//
 	// Created on first use rather than in New(): the zero Client is
 	// constructible and the tests build one. The lazy init and every
@@ -176,8 +176,9 @@ type handledResponse struct {
 }
 
 // responseHandlers holds the handlers waiting for a reply. JOB_CREATED and
-// ECHO_RES carry no correlation id, so each gets one slot; STATUS_RES carries
-// the job handle, so those are keyed by it.
+// ECHO_RES carry no correlation id, so each gets a FIFO queue matching replies
+// to requests by arrival order; STATUS_RES carries the job handle, so those
+// are keyed by it.
 //
 // Zero value ready. Each member locks itself: no operation spans two, so there
 // is no order to get wrong.
@@ -185,61 +186,6 @@ type responseHandlers struct {
 	created handlerSlot
 	echo    handlerSlot
 	status  statusHandlers
-}
-
-// handlerSlot holds at most one handler, which is all do and Echo can have
-// outstanding: both hold client.Mutex across the whole round trip.
-type handlerSlot struct {
-	mu sync.Mutex
-	h  handledResponse
-}
-
-func (s *handlerSlot) set(internal, external ResponseHandler) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.h = handledResponse{internal: internal, external: external}
-}
-
-// take empties the slot and returns what was in it.
-func (s *handlerSlot) take() (h handledResponse) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	h, s.h = s.h, handledResponse{}
-	return
-}
-
-func (s *handlerSlot) cancel() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.h = handledResponse{}
-}
-
-type statusHandlers struct {
-	mu sync.Mutex
-	m  map[string]handledResponse
-}
-
-func (s *statusHandlers) set(handle string, internal ResponseHandler) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.m == nil {
-		s.m = make(map[string]handledResponse, queueSize)
-	}
-	s.m[handle] = handledResponse{internal: internal}
-}
-
-func (s *statusHandlers) take(handle string) (h handledResponse) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	h = s.m[handle]
-	delete(s.m, handle)
-	return
-}
-
-func (s *statusHandlers) cancel(handle string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.m, handle)
 }
 
 // New returns a client. Options are applied before connect(), so a handler
@@ -554,7 +500,7 @@ func (client *Client) do(funcname string, data []byte, flag uint32, h ResponseHa
 	// Locals, not the named returns: this runs on processLoop's goroutine, and
 	// a response arriving after the timeout would be writing them while do has
 	// already returned.
-	client.handlers.created.set(func(resp *Response) {
+	token := client.handlers.created.set(func(resp *Response) {
 		if resp.DataType == dtError {
 			result <- handleOrError{"", getError(resp.Data)}
 			return
@@ -562,7 +508,7 @@ func (client *Client) do(funcname string, data []byte, flag uint32, h ResponseHa
 		result <- handleOrError{resp.Handle, nil}
 	}, h)
 	if err = client.write(encodeJob(flag, funcname, id, data)); err != nil {
-		client.handlers.created.cancel()
+		client.handlers.created.cancel(token)
 		return
 	}
 	// The shared timer, reset rather than allocated: a round trip is
@@ -574,7 +520,7 @@ func (client *Client) do(funcname string, data []byte, flag uint32, h ResponseHa
 	case ret := <-result:
 		return ret.handle, ret.err
 	case <-timeout:
-		client.handlers.created.cancel()
+		client.handlers.created.abandon(token, client.ResponseTimeout)
 		return "", ErrLostConn
 	}
 	return
@@ -647,11 +593,11 @@ func (client *Client) Echo(data []byte) (echo []byte, err error) {
 	var result = make(chan []byte, 1) // buffered, see Status
 	client.Lock()
 	defer client.Unlock()
-	client.handlers.echo.set(func(resp *Response) {
+	token := client.handlers.echo.set(func(resp *Response) {
 		result <- resp.Data
 	}, nil)
 	if err = client.write(encodeRequest(dtEchoReq, data)); err != nil {
-		client.handlers.echo.cancel()
+		client.handlers.echo.cancel(token)
 		return nil, err
 	}
 	timeout := client.startTimer() // shared and reset, see do
@@ -660,7 +606,7 @@ func (client *Client) Echo(data []byte) (echo []byte, err error) {
 	case ret := <-result:
 		return ret, nil
 	case <-timeout:
-		client.handlers.echo.cancel()
+		client.handlers.echo.abandon(token, client.ResponseTimeout)
 		return nil, ErrLostConn
 	}
 }
@@ -668,9 +614,12 @@ func (client *Client) Echo(data []byte) (echo []byte, err error) {
 // closeConn drops the current connection, taking connMu and nothing else:
 // readLoop calls it, and client.Mutex is held across whole round trips.
 //
-// conn and rw are all it touches and both are connMu's property. A concurrent
-// write took its rw snapshot through getRW() and either writes to a closed
-// connection (an error) or finds nil (ErrLostConn). Idempotent.
+// conn and rw are connMu's property. A concurrent write took its rw snapshot
+// through getRW() and either writes to a closed connection (an error) or
+// finds nil (ErrLostConn). Idempotent.
+//
+// It also empties both handler queues -- see reset. Each takes its own lock,
+// never client.Mutex, which readLoop may not touch.
 func (client *Client) closeConn() (err error) {
 	client.connMu.Lock()
 	defer client.connMu.Unlock()
@@ -678,6 +627,8 @@ func (client *Client) closeConn() (err error) {
 		err = client.conn.Close()
 		client.conn = nil
 		client.rw = nil
+		client.handlers.created.reset()
+		client.handlers.echo.reset()
 	}
 	return
 }

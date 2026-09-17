@@ -295,14 +295,14 @@ func poolRaceHammer(t *testing.T) {
 		}
 	}()
 
-	// Real Add/Remove cycles, for the insert side of the map write. Bounded
-	// because Remove is a bare delete and does not Close the client, so each
-	// cycle leaks a socket and two goroutines. They die with the child.
+	// Real Add/Remove cycles, for the insert side of the map write. Bounded to
+	// 50 until Remove started closing what it dropped; a cycle leaks nothing
+	// now, so it runs the whole hammer window like the loops above.
 	go func() {
 		churn := newFakeServer(t)
 		defer churn.close()
 		churn.handle = jobCreatedServer
-		for i := 0; i < 50; i++ {
+		for {
 			select {
 			case <-done:
 				return

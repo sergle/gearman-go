@@ -264,25 +264,55 @@ concurrently. Both go through an internal `atomic.Pointer[ErrorHandler]`.
 
 Responses are correlated by **position, not by request identity**, and
 `client.handlers` (`responseHandlers`) says so in its shape: `created` and
-`echo` are each a `handlerSlot` holding exactly one handler, because
-`JOB_CREATED` and `ECHO_RES` carry no correlation id; `status` is a map keyed by
-the job handle, which `STATUS_RES` does carry. Each member locks itself — no
-operation spans two.
+`echo` are each a `handlerSlot` — a bounded FIFO queue, in
+`client/handler_slot.go` — because `JOB_CREATED` and `ECHO_RES` carry no
+correlation id; `status` is a map keyed by the job handle, which `STATUS_RES`
+does carry. Each member locks itself — no operation
+spans two.
 
-`take` empties a slot and returns what was in it, or the zero value when it was
-empty; `deliver` then runs the handler **outside** that lock, and moves the
+A queue rather than one entry is what closed the gap where a timed-out
+caller's late reply satisfied whichever caller issued the next request:
+`do`, `Status` and `Echo` each hold `client.Mutex` across their whole round
+trip (see below), so at most one entry is ever *live* — its caller still
+waiting — and it is always the newest one in the queue. `set` returns a token
+identifying the entry it just queued. A write failure calls `cancel(token)`,
+removing exactly that entry, because no reply is coming and leaving it would
+wrongly absorb a later one. A timeout calls `abandon(token)` instead, which
+zeroes the entry's handler but leaves it queued, because its reply may still
+be in flight and has to be absorbed by *something* — removing it would recreate
+the original bug one entry later. `handlerSlotCap` (`queueSize`) bounds the
+queue against a server that never answers at all: past the cap, `set` evicts
+the oldest entry -- but only when it checks that entry is already spent (nil
+handler), rather than trusting the invariant above unconditionally. Every
+caller today upholds it, so eviction is the normal case; the check is what
+stops a future caller that doesn't from silently losing a live handler instead
+of just growing the queue past its cap.
+
+`take` pops the front entry and returns it, or the zero value when the queue is
+empty; `deliver` then runs the handler **outside** the slot lock, and moves the
 caller's external handler into `processLoop`'s own `rhandlers` map keyed by the
-real job handle once the server assigns one. Never call a handler while holding
-the slot lock.
+real job handle once the server assigns one. An abandoned entry's handler is
+already the zero value, so `deliver` no-ops on it exactly as it did on an empty
+slot before. Never call a handler while holding the slot lock.
 
-One slot per packet type means a timed-out caller's late reply can satisfy the
-next one. Known and still open; the fix is a FIFO inside `handlerSlot`, which is
-why both slots share that one type.
+A queued entry left with no expiry starves every later caller if its own
+reply never arrives at all (not just late): each no-op absorbs the *next*
+caller's reply instead, that caller abandons its own entry the same way, and
+the debt just moves rather than draining. `abandon` stamps `ttl` (the
+client's `ResponseTimeout`) as the entry's deadline, and `take` drops a
+front entry past its deadline before correlating. This is a bound, not a full
+fix: nothing on the wire tells a late-but-real reply apart from the next
+request's own reply, so a caller retrying immediately after a timeout can
+still lose once to a stale entry, exactly as before -- `take` cannot tell them
+apart and must not, or the late-reply case above breaks. What it stops is the
+debt persisting forever: once a gap exceeds `ttl`, or the connection drops,
+the entry is gone. `closeConn` calls `reset` on both queues for the latter
+case -- nothing on a closed connection will ever answer what was queued on it.
 
-Those fixed slots are why `do`, `Status` and `Echo` each hold `client.Mutex`
-across the **entire** round trip — write, then block on the result channel
-until `processLoop` delivers or `ResponseTimeout` fires. The same mutex
-serialises the one shared `bufio.Writer`:
+`do`, `Status` and `Echo` each hold `client.Mutex` across the **entire** round
+trip — write, then block on the result channel until `processLoop` delivers or
+`ResponseTimeout` fires. The same mutex serialises the one shared
+`bufio.Writer`:
 
 > Every `client.write` call site holds `client.Mutex`. `connect()` is the only
 > exception, and only because its `rw` is not published by `setConn` yet.

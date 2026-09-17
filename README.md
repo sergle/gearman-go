@@ -35,6 +35,11 @@ had the same problem — plain fields read from every agent's connection
 goroutine — and are gone the same way, replaced by `SetErrorHandler` and
 `SetJobHandler`, shown below.
 
+**Nor `Pool`'s.** `Pool.ErrorHandler` was a field nothing in `pool.go` ever
+read, so setting it did nothing. It is gone too, replaced by
+`Pool.SetErrorHandler`, which installs the handler on every client already in
+the pool and on every one `Add` brings in later.
+
 Install
 =======
 
@@ -46,7 +51,7 @@ module instead:
 ```
 require github.com/mikespook/gearman-go v0.0.0
 
-replace github.com/mikespook/gearman-go => github.com/sergle/gearman-go v0.1.0
+replace github.com/mikespook/gearman-go => github.com/sergle/gearman-go v0.2.0
 ```
 
 Usage
@@ -63,7 +68,7 @@ w := worker.New(worker.OneByOne)
 w.SetErrorHandler(func(e error) {
 	log.Println(e)
 })
-w.AddServer("127.0.0.1:4730")
+w.AddServer("tcp4", "127.0.0.1:4730")
 // Use worker.Unlimited (0) if you want no timeout
 w.AddFunc("ToUpper", ToUpper, worker.Unlimited)
 // This will give a timeout of 5 seconds
