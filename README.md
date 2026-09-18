@@ -18,12 +18,75 @@ Fork
 ====
 
 This is a fork of [mikespook/gearman-go](https://github.com/mikespook/gearman-go),
-which is a GOPATH-era repository with no `go.mod`. This one is a proper module
-and carries fixes upstream does not have — several data races, lost packet
-framing on a split read, a `Pool` that could spin or crash when reconfigured,
-and `Status`/`Echo` blocking forever against a silent server.
+which is a GOPATH-era repository with no `go.mod`. This one is a proper module,
+and it fixes more than two dozen defects upstream still has — concurrency bugs
+that crash or wedge a process, packet framing that silently stops a worker, and
+a `Pool` that could spin, panic or leak.
 
-**Requires Go 1.23 or later.**
+### What it fixes
+
+Every item below is fixed here and reproduced by a test in this repository.
+None of it is upstream.
+
+**Crashes and hangs.** A worker whose job functions were added or removed while
+it ran hit a concurrent map read/write — a runtime throw no `recover` catches.
+`Pool` did the same on its `Clients` map, and could spin at 100% CPU or panic
+outright when reconfigured. `Close` on a worker panicked by closing a channel
+under a live sender. A malformed `STATUS_RES` panicked the client. One dropped
+connection could freeze an entire worker: the disconnect handler ran while
+holding the lock both of its documented responses need, so the handler blocked
+forever, in-flight jobs blocked behind it, and the dispatcher wedged. A
+reconnect racing `AddFunc` deadlocked outright — two goroutines, one lock each,
+opposite order.
+
+**Silent wrong behaviour**, the worse kind. A worker that read a packet split
+across two reads framed every later packet from the wrong offset and simply
+stopped picking up jobs, with no error anywhere. A second `Ready()` opened a
+duplicate connection and left two goroutines reading one buffer. Job progress
+reports (`SendData`, `UpdateStatus`) were written without the lock every other
+writer takes, interleaving bytes inside a single packet on the wire. A
+timed-out `Echo`'s late reply was delivered to the *next* caller. `Pool.Remove`
+dropped a client without closing it, leaking a socket and two goroutines per
+call, so a service reloading its server list leaked on every reload.
+`Pool.ErrorHandler` was a field nothing ever read: every connection error
+inside a pooled client went to the floor.
+
+**Blocking forever.** `Status` and `Echo` had no timeout — against a server
+that stopped answering they blocked their caller permanently. They now fail
+with `ErrLostConn` after `ResponseTimeout`.
+
+**Data races.** Both packages are clean under `-race`, including against live
+job servers. Upstream is not: the worker's connection pointers, the client's
+and worker's handler fields, the function map and the ready flag were all read
+from one goroutine while another wrote them.
+
+### Allocations
+
+Measured against upstream at the point this fork merged it, with this
+repository's benchmarks ported onto that tree. Allocations, not timings: on
+this hardware `ns/op` drifts by 30% between runs of identical code, so it is
+not a number worth quoting.
+
+- **Submitting a job costs 13 allocations instead of 20**, and 560 bytes
+  instead of ~9 KB. `Do` costs 20 instead of 27, `Status` 15 instead of 20.
+  Most of the bytes are one line: upstream allocates a fresh 8 KB scratch
+  buffer on every read, where this fork keeps one per connection.
+- **Running a job through a worker costs 8 allocations instead of 11**, ~265
+  bytes instead of ~1.1 KB. The packet decoder scans in place rather than
+  splitting, `read` allocates a single buffer sized to the packet instead of a
+  1 KB scratch plus a `bytes.Buffer`, and `write` reuses a pooled buffer and
+  allocates nothing at all — including for a 32 KB payload.
+- **A 64 KB job stalls upstream in about half of benchmark runs**, which is the
+  split-read framing defect rather than a slow path. When it does complete it
+  costs 20 allocations against this fork's 9.
+- Two places this fork is not cheaper. `Echo` allocates the same 9 times — it
+  just moves 8 KB less — and a foreground `Do` pays one allocation more,
+  because packets are framed one at a time instead of sharing a buffer when
+  two arrive in the same read. That is the cost of the framing fix.
+
+**Requires Go 1.23 or later**: before it, `Timer.Reset` did not clear an
+already-delivered tick, and the client's shared timer would hand the next
+caller an instant, bogus timeout.
 
 **The client API is not compatible with upstream.** `Client.ErrorHandler` was an
 exported field that could not be assigned without racing the client's own read
@@ -167,10 +230,12 @@ Version 0.x means: _It is far far away from stable._
 
 __Use at your own risk!__
 
-Below v1 a minor bump may break the API, and this one will: known defects still
-open include correlation by fixed handler slot (a late response can satisfy the
-wrong caller) and a re-dial that can resurrect a connection the caller closed.
-Pin an exact version.
+Below v1 a minor bump may break the API, and this one already has three times —
+each to remove an exported field that could not be used safely. Pin an exact
+version.
+
+The defect list this fork was built from is closed, but `Pool` failover remains
+untested and the accepted trade-offs above are real. Report anything you hit.
 
 Contributors
 ============
